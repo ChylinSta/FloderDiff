@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { compareFolders } from "./folder";
+import type { CompareProgress } from "./types";
 import type { CompareEntry } from "./types";
 
 const cleanup: string[] = [];
@@ -179,6 +180,33 @@ describe("folder walk classification", () => {
       await chmod(lockedLeft, 0o700);
       await chmod(lockedRight, 0o700);
     }
+  });
+
+  it("reports walk and hash progress and can cancel", async () => {
+    const { left, right } = await pair();
+    await file(left, "a.txt", "one");
+    await file(right, "a.txt", "two");
+    await file(left, "b.txt", "same");
+    await file(right, "b.txt", "same");
+    const events: CompareProgress[] = [];
+    await compareFolders(left, right, [], {
+      onProgress: (progress) => {
+        events.push(progress);
+      },
+    });
+    expect(events.some((event) => event.phase === "walk" && event.done > 0)).toBe(true);
+    const finished = events.filter((event) => event.phase === "hash" && event.done === event.total);
+    expect(finished.at(-1)?.total).toBe(2);
+
+    const controller = new AbortController();
+    await expect(
+      compareFolders(left, right, [], {
+        signal: controller.signal,
+        onProgress: () => {
+          controller.abort();
+        },
+      }),
+    ).rejects.toThrow(/cancelled/i);
   });
 
   it("fixture trees match the documented categories", async () => {

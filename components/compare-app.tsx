@@ -1,12 +1,20 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { FixturePaths } from "@/lib/compare/fixtures";
-import type { CompareEntry, FileDiffResult, FolderCompareResult } from "@/lib/compare/types";
+import type { CompareEntry, CompareProgress, FileDiffResult, FolderCompareResult } from "@/lib/compare/types";
 
 import { BrowseDialog } from "./browse-dialog";
 import { defaultExpanded, type StatusFilter } from "./compare-view";
@@ -43,6 +51,10 @@ export function CompareApp() {
   const [browseOpen, setBrowseOpen] = useState(false);
   const [mobilePane, setMobilePane] = useState<"tree" | "diff">("tree");
   const [fixtures, setFixtures] = useState<FixturePaths | null>(null);
+  const [progress, setProgress] = useState<CompareProgress | null>(null);
+  const [recent, setRecent] = useState<string[]>([]);
+  const [pendingCopy, setPendingCopy] = useState<PendingCopy | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -63,17 +75,26 @@ export function CompareApp() {
     };
   }, []);
 
+  useEffect(() => {
+    const id = window.setTimeout(() => setRecent(readRecent()), 0);
+    return () => window.clearTimeout(id);
+  }, []);
+
   const selected = folder?.entries.find((entry) => entry.relativePath === selectedPath) ?? null;
 
-  async function runCompare(overrides?: { mode?: Mode; left?: string; right?: string; keepSelection?: boolean }) {
+  async function runCompare(overrides?: { mode?: Mode; left?: string; right?: string; keepSelection?: boolean }): Promise<boolean> {
     const nextMode = overrides?.mode ?? mode;
     const nextLeft = (overrides?.left ?? left).trim();
     const nextRight = (overrides?.right ?? right).trim();
     if (!nextLeft || !nextRight) {
       setError("Enter both paths, or open a sample.");
-      return;
+      return false;
     }
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
     setLoading(true);
+    setProgress(null);
     setError(null);
     setNotice(null);
     setManualCopy(null);
@@ -84,11 +105,13 @@ export function CompareApp() {
           .split(",")
           .map((pattern) => pattern.trim())
           .filter(Boolean);
-        const result = await postJson<FolderCompareResult>("/api/compare", {
-          left: nextLeft,
-          right: nextRight,
-          patterns,
-        });
+        setProgress({ phase: "walk", done: 0, total: 0 });
+        const result = await streamCompare(
+          { left: nextLeft, right: nextRight, patterns },
+          { signal: controller.signal, onProgress: setProgress },
+        );
+        if (controller.signal.aborted) return false;
+        setRecent(rememberPaths([result.leftRoot, result.rightRoot]));
         setFolder(result);
         setExpanded(defaultExpanded(result.entries));
         setMobilePane("tree");
@@ -108,17 +131,80 @@ export function CompareApp() {
           setDiffSource(null);
         }
       } else {
-        const result = await postJson<FileDiffResult>("/api/diff", { left: nextLeft, right: nextRight });
+        const result = await postJson<FileDiffResult>("/api/diff", { left: nextLeft, right: nextRight }, controller.signal);
+        if (controller.signal.aborted) return false;
+        setRecent(rememberPaths([nextLeft, nextRight]));
         setDiff(result);
         setDiffSource("file");
         setFolder(null);
         setSelectedPath(null);
         setMobilePane("diff");
       }
+            return true;
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Compare failed.");
+      if (isAbort(caught) || controller.signal.aborted) {
+        setNotice("Compare cancelled.");
+      } else {
+        setError(caught instanceof Error ? caught.message : "Compare failed.");
+      }
+      if (abortRef.current === controller) setProgress(null);
+      return false;
     } finally {
-      setLoading(false);
+      if (abortRef.current === controller) setLoading(false);
+    }
+  }
+
+  function cancelCompare() {
+    abortRef.current?.abort();
+  }
+
+  function requestFileCopy(direction: "left-to-right" | "right-to-left") {
+    if (mode === "files") {
+      const from = direction === "left-to-right" ? left.trim() : right.trim();
+      const to = direction === "left-to-right" ? right.trim() : left.trim();
+      if (!from || !to) return;
+      setPendingCopy({
+        from,
+        to,
+        overwrite: true,
+        label: `Replace ${to} with the other file? This overwrites that path.`,
+      });
+      return;
+    }
+    if (!selected || !folder || selected.type !== "file") return;
+    const from = direction === "left-to-right" ? selected.leftPath : selected.rightPath;
+    const toRoot = direction === "left-to-right" ? folder.rightRoot : folder.leftRoot;
+    const destinationExists = direction === "left-to-right" ? Boolean(selected.right) : Boolean(selected.left);
+    if (!from) return;
+    const side = direction === "left-to-right" ? "right" : "left";
+    setPendingCopy({
+      from,
+      toRoot,
+      relativePath: selected.relativePath,
+      overwrite: destinationExists,
+      label: destinationExists
+        ? `Replace ${selected.relativePath} on the ${side}? This overwrites that file.`
+        : `Copy ${selected.relativePath} to the ${side}? A new file will be created there.`,
+    });
+  }
+
+  async function confirmCopy() {
+    if (!pendingCopy) return;
+    const request = pendingCopy;
+    setPendingCopy(null);
+    setError(null);
+    try {
+      await postJson("/api/copy", {
+        from: request.from,
+        to: request.to,
+        toRoot: request.toRoot,
+        relativePath: request.relativePath,
+        overwrite: request.overwrite,
+      });
+      const refreshed = await runCompare({ keepSelection: true });
+      if (refreshed) setNotice(request.overwrite ? "Replaced the destination file." : "Copied the file.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not copy that file.");
     }
   }
 
@@ -192,6 +278,7 @@ export function CompareApp() {
 
   const activeDiff = mode === "files" ? (diffSource === "file" ? diff : null) : diffSource === "entry" ? diff : null;
   const detail = describeSelection(mode, selected, left, right, activeDiff);
+  const fileCopy = copyAffordances(mode, selected, activeDiff, left, right);
   const showTree = mode === "folders" && folder;
   const hasWorkspace = mode === "folders" ? Boolean(folder) || loading : Boolean(activeDiff) || loading;
 
@@ -218,8 +305,34 @@ export function CompareApp() {
           <Button type="button" variant="outline" disabled={loading} onClick={() => void runCompare({ keepSelection: true })}>
             Refresh
           </Button>
+          {loading ? (
+            <Button type="button" variant="outline" onClick={cancelCompare}>
+              Cancel
+            </Button>
+          ) : null}
         </div>
       </header>
+
+      {progress ? (
+        <div className="sticky top-0 z-30 flex flex-wrap items-center gap-3 border-b bg-primary px-4 py-2 text-sm text-primary-foreground" role="status">
+          <span>
+            {loading
+              ? progress.phase === "walk"
+                ? "Walking both trees"
+                : "Hashing files"
+              : progress.phase === "hash"
+                ? "Finished hashing"
+                : "Finished walking"}
+            {progress.phase === "hash" ? ` ${progress.done} / ${progress.total}` : ` · ${progress.done} paths`}
+          </span>
+          {progress.path ? <span className="min-w-0 flex-1 truncate font-mono text-xs opacity-90">{progress.path}</span> : null}
+          {loading ? (
+            <Button type="button" size="sm" variant="secondary" onClick={cancelCompare}>
+              Cancel
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
 
       <form
         className="grid gap-3 border-b px-4 py-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]"
@@ -228,20 +341,8 @@ export function CompareApp() {
           void runCompare();
         }}
       >
-        <PathField
-          id="left-path"
-          label="Left"
-          value={left}
-          onChange={setLeft}
-          onBrowse={() => setBrowseOpen(true)}
-        />
-        <PathField
-          id="right-path"
-          label="Right"
-          value={right}
-          onChange={setRight}
-          onBrowse={() => setBrowseOpen(true)}
-        />
+        <PathField id="left-path" label="Left" value={left} onChange={setLeft} onBrowse={() => setBrowseOpen(true)} />
+        <PathField id="right-path" label="Right" value={right} onChange={setRight} onBrowse={() => setBrowseOpen(true)} />
         <div className="flex flex-wrap items-end gap-2">
           <Button type="submit" disabled={loading}>
             {loading ? "Reading…" : mode === "folders" ? "Compare folders" : "Compare files"}
@@ -281,6 +382,24 @@ export function CompareApp() {
             Line endings are aligned. A null byte or invalid UTF-8 is reported as binary.
           </p>
         )}
+        {recent.length > 0 ? (
+          <div className="flex flex-col gap-1 lg:col-span-3">
+            <span className="text-xs font-medium text-muted-foreground">Recent paths</span>
+            {recent.slice(0, 4).map((path) => (
+              <div key={path} className="flex items-center gap-1">
+                <span className="min-w-0 flex-1 truncate font-mono text-[11px] font-normal" title={path}>
+                  {path}
+                </span>
+                <Button type="button" size="xs" variant="outline" onClick={() => setLeft(path)}>
+                  Left
+                </Button>
+                <Button type="button" size="xs" variant="outline" onClick={() => setRight(path)}>
+                  Right
+                </Button>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </form>
 
       {error ? (
@@ -376,6 +495,15 @@ export function CompareApp() {
                     loading={loading}
                     onCopy={(target) => void copyPath(target)}
                     onOpen={(target) => void openPath(target)}
+                    fileCopy={
+                      fileCopy
+                        ? {
+                            leftToRight: fileCopy.leftToRight,
+                            rightToLeft: fileCopy.rightToLeft,
+                            onCopy: requestFileCopy,
+                          }
+                        : undefined
+                    }
                   />
                 </div>
               </div>
@@ -385,11 +513,29 @@ export function CompareApp() {
       </div>
 
       <footer className="border-t px-4 py-2 text-[11px] text-muted-foreground">
-        FolderDiff reads the filesystem of the account running this server and listens on 127.0.0.1. It does not copy or delete files.
+        FolderDiff reads files for the account running this server, and copies a file only after you confirm. It listens on 127.0.0.1 and does not delete files.
       </footer>
+
+      <Dialog open={pendingCopy !== null} onOpenChange={(open) => { if (!open) setPendingCopy(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{pendingCopy?.overwrite ? "Overwrite this file?" : "Copy this file?"}</DialogTitle>
+            <DialogDescription>{pendingCopy?.label}</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={() => setPendingCopy(null)}>
+              Cancel
+            </Button>
+            <Button type="button" onClick={() => void confirmCopy()}>
+              {pendingCopy?.overwrite ? "Overwrite" : "Copy"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <BrowseDialog
         open={browseOpen}
+        recent={recent}
         onOpenChange={setBrowseOpen}
         onPick={(path, kind, side) => {
           if (side === "left") setLeft(path);
@@ -416,9 +562,10 @@ function PathField({
   onChange: (value: string) => void;
   onBrowse: () => void;
 }) {
+  const kind = usePathKind(value);
   return (
-    <label className="block text-xs font-medium text-muted-foreground" htmlFor={id}>
-      {label}
+    <div className="block text-xs font-medium text-muted-foreground">
+      <label htmlFor={id}>{label}</label>
       <span className="mt-1 flex gap-1.5">
         <Input
           id={id}
@@ -432,8 +579,59 @@ function PathField({
           Browse
         </Button>
       </span>
-    </label>
+      <span className={`mt-1 block font-normal ${kind === "missing" ? "text-destructive" : ""}`}>
+        {kindLabel(kind)}
+      </span>
+    </div>
   );
+}
+
+function usePathKind(value: string): string | null {
+  const trimmed = value.trim();
+  const [checked, setChecked] = useState<{ path: string; kind: string } | null>(null);
+  useEffect(() => {
+    if (!trimmed) return;
+    const timer = window.setTimeout(() => {
+      void fetch(`/api/stat?path=${encodeURIComponent(trimmed)}`, { cache: "no-store" })
+        .then(async (response) => response.json() as Promise<{ exists?: boolean; kind?: string }>)
+        .then((body) => {
+          setChecked({ path: trimmed, kind: body.exists ? (body.kind ?? "other") : "missing" });
+        })
+        .catch(() => setChecked({ path: trimmed, kind: "unknown" }));
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [trimmed]);
+  if (!trimmed) return null;
+  if (!checked || checked.path !== trimmed) return "checking";
+  return checked.kind;
+}
+
+function kindLabel(kind: string | null): string {
+  if (kind === "directory") return "Folder";
+  if (kind === "file") return "File";
+  if (kind === "symlink") return "Symlink";
+  if (kind === "missing") return "Path not found";
+  if (kind === "other") return "Special file";
+  if (kind === "checking") return "Checking this path…";
+  if (kind === "unknown") return "Could not check that path.";
+  return "Paste a path, or browse.";
+}
+
+function copyAffordances(
+  mode: Mode,
+  selected: CompareEntry | null,
+  diff: FileDiffResult | null,
+  left: string,
+  right: string,
+): { leftToRight: boolean; rightToLeft: boolean } | null {
+  if (mode === "files" && diff && !diff.identical && left.trim() && right.trim()) {
+    return { leftToRight: true, rightToLeft: true };
+  }
+  if (mode !== "folders" || !selected || selected.type !== "file" || selected.error) return null;
+  if (selected.status === "left-only") return { leftToRight: true, rightToLeft: false };
+  if (selected.status === "right-only") return { leftToRight: false, rightToLeft: true };
+  if (selected.status === "different") return { leftToRight: true, rightToLeft: true };
+  return null;
 }
 
 function EmptyState({ onFolders, onFiles }: { onFolders: () => void; onFiles: () => void }) {
@@ -567,11 +765,12 @@ function describeSelection(
   };
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
+async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    signal,
   });
   const payload = (await response.json().catch(() => ({}))) as { error?: string };
   if (!response.ok) {
@@ -579,3 +778,90 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
   }
   return payload as T;
 }
+
+type CompareStreamEvent =
+  | (CompareProgress & { type: "progress" })
+  | { type: "result"; result: FolderCompareResult }
+  | { type: "error"; error: string };
+
+async function streamCompare(
+  body: { left: string; right: string; patterns: string[] },
+  options: { signal: AbortSignal; onProgress: (progress: CompareProgress) => void },
+): Promise<FolderCompareResult> {
+  const response = await fetch("/api/compare", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal: options.signal,
+  });
+  if (!response.ok || !response.body) {
+    const payload = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(payload.error ?? `Request failed (${response.status}).`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: FolderCompareResult | null = null;
+  let latest: CompareProgress | null = null;
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line) as CompareStreamEvent;
+      if (event.type === "progress") latest = event;
+      else if (event.type === "error") throw new Error(event.error);
+      else result = event.result;
+    }
+    if (latest) {
+      options.onProgress(latest);
+      latest = null;
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+    }
+  }
+  if (!result) throw new Error("The compare ended before a result was ready.");
+  return result;
+}
+
+function isAbort(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+const RECENT_KEY = "folderdiff-recent-paths";
+
+function readRecent(): string[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const parsed = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]") as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string").slice(0, 8);
+  } catch {
+    return [];
+  }
+}
+
+function rememberPaths(paths: string[]): string[] {
+  const next: string[] = [];
+  for (const path of [...paths, ...readRecent()]) {
+    const trimmed = path.trim();
+    if (!trimmed || next.includes(trimmed)) continue;
+    next.push(trimmed);
+    if (next.length === 8) break;
+  }
+  localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+  return next;
+}
+
+type PendingCopy = {
+  from: string;
+  to?: string;
+  toRoot?: string;
+  relativePath?: string;
+  overwrite: boolean;
+  label: string;
+};

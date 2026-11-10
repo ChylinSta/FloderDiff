@@ -10,14 +10,17 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { BrowseResult } from "@/lib/compare/types";
+import { Input } from "@/components/ui/input";
+import type { BrowseResult, PathDescription } from "@/lib/compare/types";
 
 export function BrowseDialog({
   open,
+  recent,
   onOpenChange,
   onPick,
 }: {
   open: boolean;
+  recent: string[];
   onOpenChange: (open: boolean) => void;
   onPick: (path: string, kind: "file" | "directory", side: "left" | "right") => void;
 }) {
@@ -25,6 +28,8 @@ export function BrowseDialog({
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [current, setCurrent] = useState<string | null>(null);
+  const [pasted, setPasted] = useState("");
+  const [fileCandidate, setFileCandidate] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -65,9 +70,48 @@ export function BrowseDialog({
         <DialogHeader>
           <DialogTitle>Browse this machine</DialogTitle>
           <DialogDescription>
-            Pick a folder or file. FolderDiff only lists paths your user can read.
+            Paste a path or pick a folder. FolderDiff only lists paths your user can read.
           </DialogDescription>
         </DialogHeader>
+        <form
+          className="flex gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void goTo(pasted, setCurrent, setFileCandidate, setError);
+          }}
+        >
+          <Input
+            value={pasted}
+            onChange={(event) => setPasted(event.target.value)}
+            placeholder="Paste a path"
+            className="font-mono"
+            spellCheck={false}
+            aria-label="Path to open"
+          />
+          <Button type="submit" variant="outline">
+            Go
+          </Button>
+        </form>
+        {fileCandidate ? (
+          <div className="flex flex-wrap items-center gap-1.5 text-xs">
+            <span className="text-muted-foreground">That path is a file.</span>
+            <Button type="button" size="xs" onClick={() => onPick(fileCandidate, "file", "left")}>
+              Use as left
+            </Button>
+            <Button type="button" size="xs" variant="outline" onClick={() => onPick(fileCandidate, "file", "right")}>
+              Use as right
+            </Button>
+          </div>
+        ) : null}
+        {recent.length > 0 ? (
+          <div className="flex flex-wrap gap-1">
+            {recent.map((path) => (
+              <Button key={path} type="button" size="xs" variant="ghost" className="max-w-full" onClick={() => void goTo(path, setCurrent, setFileCandidate, setError)}>
+                <span className="truncate font-mono">{path}</span>
+              </Button>
+            ))}
+          </div>
+        ) : null}
         <div className="flex flex-wrap gap-1.5">
           {listing?.roots.map((root) => (
             <Button key={root} type="button" size="sm" variant="outline" onClick={() => setCurrent(root)}>
@@ -153,6 +197,29 @@ export function BrowseDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+async function goTo(raw: string, setCurrent: (path: string) => void, setFileCandidate: (path: string | null) => void, setError: (message: string | null) => void) {
+  const target = raw.trim();
+  if (!target) return;
+  setError(null);
+  const response = await fetch(`/api/stat?path=${encodeURIComponent(target)}`, { cache: "no-store" });
+  const body = (await response.json()) as PathDescription & { error?: string };
+  if (!response.ok) {
+    setError(body.error ?? "Could not read that path.");
+    return;
+  }
+  if (!body.exists) {
+    setFileCandidate(null);
+    setError("Path not found.");
+    return;
+  }
+  if (body.kind === "file") {
+    setFileCandidate(body.path);
+    return;
+  }
+  setFileCandidate(null);
+  setCurrent(body.path);
 }
 
 function joinPath(parent: string, name: string): string {

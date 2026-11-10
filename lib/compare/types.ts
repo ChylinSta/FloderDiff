@@ -42,12 +42,23 @@ export type FolderCompareResult = {
 
 export type LineChange = "equal" | "insert" | "delete" | "change";
 
+export type InlineChange = "equal" | "delete" | "insert";
+
+export type InlineSpan = {
+  change: InlineChange;
+  text: string;
+};
+
+export type TextEncoding = "utf-8" | "utf-16le" | "utf-16be";
+
 export type DiffRow = {
   change: LineChange;
   leftLine: number | null;
   rightLine: number | null;
   leftText: string | null;
   rightText: string | null;
+  leftSpans?: InlineSpan[];
+  rightSpans?: InlineSpan[];
 };
 
 export type DiffHunk = {
@@ -68,8 +79,26 @@ export type FileDiffResult = {
   rightBytes: number;
   leftHash: string;
   rightHash: string;
+  leftEncoding?: TextEncoding;
+  rightEncoding?: TextEncoding;
+  encodingsDiffer: boolean;
   counts: { equal: number; insert: number; delete: number; change: number };
   hunks: DiffHunk[];
+};
+
+export type CompareProgress = {
+  phase: "walk" | "hash";
+  done: number;
+  total: number;
+  path?: string;
+};
+
+export type PathKind = "file" | "directory" | "symlink" | "other" | "missing";
+
+export type PathDescription = {
+  path: string;
+  exists: boolean;
+  kind: PathKind;
 };
 
 export type BrowseEntry = {

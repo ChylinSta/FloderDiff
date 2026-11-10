@@ -43,10 +43,19 @@ async function assertKind(input: string, expected: "directory" | "file"): Promis
   return resolved;
 }
 
-export async function walkTree(root: string, ignore: IgnoreRules): Promise<WalkResult> {
+export type WalkOptions = {
+  signal?: AbortSignal;
+  onVisit?: (relativePath: string) => void | Promise<void>;
+};
+
+export async function walkTree(
+  root: string,
+  ignore: IgnoreRules,
+  options?: WalkOptions,
+): Promise<WalkResult> {
   const entries = new Map<string, WalkEntry>();
   const errors = new Map<string, string>();
-  await walkDirectory(root, "", entries, errors, ignore);
+  await walkDirectory(root, "", entries, errors, ignore, options);
   return { entries, errors };
 }
 
@@ -56,7 +65,9 @@ async function walkDirectory(
   entries: Map<string, WalkEntry>,
   errors: Map<string, string>,
   ignore: IgnoreRules,
+  options?: WalkOptions,
 ): Promise<void> {
+  throwIfAborted(options?.signal);
   let dirents;
   try {
     dirents = await readdir(absoluteDir, { withFileTypes: true });
@@ -68,6 +79,7 @@ async function walkDirectory(
 
   const ordered = [...dirents].sort((a, b) => a.name.localeCompare(b.name, "en"));
   for (const dirent of ordered) {
+    throwIfAborted(options?.signal);
     if (dirent.name === "." || dirent.name === "..") continue;
     const relativePath = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
     if (ignore.match(relativePath)) continue;
@@ -92,6 +104,7 @@ async function walkDirectory(
           mtimeMs: stat.mtimeMs,
           target,
         });
+        await options?.onVisit?.(relativePath);
         continue;
       }
 
@@ -104,7 +117,8 @@ async function walkDirectory(
           size: 0,
           mtimeMs: stat.mtimeMs,
         });
-        await walkDirectory(absolutePath, relativePath, entries, errors, ignore);
+        await options?.onVisit?.(relativePath);
+        await walkDirectory(absolutePath, relativePath, entries, errors, ignore, options);
         continue;
       }
 
@@ -117,6 +131,7 @@ async function walkDirectory(
           size: stat.size,
           mtimeMs: stat.mtimeMs,
         });
+        await options?.onVisit?.(relativePath);
         continue;
       }
 
@@ -128,6 +143,7 @@ async function walkDirectory(
         size: stat.size,
         mtimeMs: stat.mtimeMs,
       });
+      await options?.onVisit?.(relativePath);
     } catch (error) {
       errors.set(
         relativePath,
@@ -135,5 +151,9 @@ async function walkDirectory(
       );
     }
   }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new CompareError("Compare cancelled.", 499);
 }
 

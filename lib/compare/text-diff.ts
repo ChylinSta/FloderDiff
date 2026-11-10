@@ -1,7 +1,9 @@
 import { diffArrays } from "diff";
 import { open, readFile, stat } from "node:fs/promises";
 
+import { decodeSample, sniffEncoding } from "./encoding";
 import { hashFile } from "./hash";
+import { inlineSpans } from "./inline";
 import type { DiffHunk, DiffRow, FileDiffResult, LineChange } from "./types";
 import { assertFile } from "./walk";
 
@@ -14,15 +16,18 @@ export async function diffFiles(leftInput: string, rightInput: string): Promise<
   const [left, right] = await Promise.all([readForDiff(leftPath), readForDiff(rightPath)]);
   const identical = left.hash === right.hash;
 
-  const leftBinary = sniffBinary(left.sample, left.truncated);
-  const rightBinary = sniffBinary(right.sample, right.truncated);
-  if (leftBinary || rightBinary) {
+  const leftEncoding = sniffEncoding(left.sample);
+  const rightEncoding = sniffEncoding(right.sample);
+  if (leftEncoding === "binary" || rightEncoding === "binary") {
+    const reason = binaryReason(left.sample, left.truncated, leftEncoding) ??
+      binaryReason(right.sample, right.truncated, rightEncoding);
     return {
       kind: "binary",
       identical,
       lineEndingsDiffer: false,
+      encodingsDiffer: false,
       truncated: false,
-      binaryReason: left.truncated || right.truncated ? "too-large" : (leftBinary ?? rightBinary)!,
+      binaryReason: reason ?? "invalid-utf8",
       leftBytes: left.size,
       rightBytes: right.size,
       leftHash: left.hash,
@@ -32,33 +37,46 @@ export async function diffFiles(leftInput: string, rightInput: string): Promise<
     };
   }
 
-  const leftText = decode(left.sample);
-  const rightText = decode(right.sample);
+  const leftText = decodeSample(left.sample, leftEncoding);
+  const rightText = decodeSample(right.sample, rightEncoding);
   const leftLines = splitLines(leftText);
   const rightLines = splitLines(rightText);
   const rows = alignLines(leftLines, rightLines);
   const counts = countRows(rows);
+  const encodingsDiffer = leftEncoding !== rightEncoding;
+  const textMatches =
+    counts.insert === 0 && counts.delete === 0 && counts.change === 0;
   const lineEndingsDiffer =
-    !identical &&
-    !left.truncated &&
-    !right.truncated &&
-    counts.insert === 0 &&
-    counts.delete === 0 &&
-    counts.change === 0;
+    !identical && !left.truncated && !right.truncated && textMatches && !encodingsDiffer;
   const truncated = !identical && (left.truncated || right.truncated);
+  const quiet = identical || lineEndingsDiffer || (textMatches && encodingsDiffer);
 
   return {
     kind: "text",
     identical,
     lineEndingsDiffer,
+    encodingsDiffer,
     truncated,
     leftBytes: left.size,
     rightBytes: right.size,
     leftHash: left.hash,
     rightHash: right.hash,
-    counts: identical || lineEndingsDiffer ? { ...counts, insert: 0, delete: 0, change: 0 } : counts,
-    hunks: identical || lineEndingsDiffer ? [] : buildHunks(rows),
+    leftEncoding,
+    rightEncoding,
+    counts: quiet ? { ...counts, insert: 0, delete: 0, change: 0 } : counts,
+    hunks: quiet ? [] : buildHunks(rows),
   };
+}
+
+function binaryReason(
+  sample: Buffer,
+  truncated: boolean,
+  encoding: ReturnType<typeof sniffEncoding>,
+): FileDiffResult["binaryReason"] | null {
+  if (encoding !== "binary") return null;
+  if (truncated) return "too-large";
+  if (sample.includes(0)) return "null-byte";
+  return "invalid-utf8";
 }
 
 type Loaded = {
@@ -83,20 +101,6 @@ async function readForDiff(absolutePath: string): Promise<Loaded> {
   } finally {
     await handle.close();
   }
-}
-
-function sniffBinary(sample: Buffer, truncated: boolean): FileDiffResult["binaryReason"] | null {
-  if (sample.includes(0)) return truncated ? "too-large" : "null-byte";
-  try {
-    new TextDecoder("utf-8", { fatal: true }).decode(sample);
-    return null;
-  } catch {
-    return truncated ? "too-large" : "invalid-utf8";
-  }
-}
-
-function decode(sample: Buffer): string {
-  return new TextDecoder("utf-8", { fatal: true }).decode(sample);
 }
 
 export function splitLines(text: string): string[] {
@@ -156,7 +160,14 @@ function alignLines(leftLines: string[], rightLines: string[]): DiffRow[] {
     for (let cursor = 0; cursor < paired; cursor += 1) {
       leftLine += 1;
       rightLine += 1;
-      rows.push(row("change", leftLine, rightLine, removed[cursor] ?? "", added[cursor] ?? ""));
+      const leftText = removed[cursor] ?? "";
+      const rightText = added[cursor] ?? "";
+      const spans = inlineSpans(leftText, rightText);
+      rows.push({
+        ...row("change", leftLine, rightLine, leftText, rightText),
+        leftSpans: spans.left,
+        rightSpans: spans.right,
+      });
     }
     for (let cursor = paired; cursor < removed.length; cursor += 1) {
       leftLine += 1;

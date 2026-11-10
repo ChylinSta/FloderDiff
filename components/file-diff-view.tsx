@@ -1,7 +1,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
-import type { FileDiffResult, LineChange } from "@/lib/compare/types";
+import type { FileDiffResult, InlineSpan, LineChange } from "@/lib/compare/types";
 
 export function FileDiffView({
   diff,
@@ -12,6 +12,7 @@ export function FileDiffView({
   loading,
   onCopy,
   onOpen,
+  fileCopy,
 }: {
   diff: FileDiffResult | null;
   heading: string;
@@ -21,6 +22,11 @@ export function FileDiffView({
   loading: boolean;
   onCopy: (path: string) => void;
   onOpen: (path: string) => void;
+  fileCopy?: {
+    leftToRight: boolean;
+    rightToLeft: boolean;
+    onCopy: (direction: "left-to-right" | "right-to-left") => void;
+  };
 }) {
   return (
     <section className="flex min-h-0 w-full min-w-0 flex-1 flex-col bg-card" aria-label="File diff">
@@ -47,6 +53,16 @@ export function FileDiffView({
             <Button type="button" size="sm" variant="outline" disabled={!rightPath} onClick={() => rightPath && onOpen(rightPath)}>
               Open right
             </Button>
+            {fileCopy?.leftToRight ? (
+              <Button type="button" size="sm" onClick={() => fileCopy.onCopy("left-to-right")}>
+                Copy left to right
+              </Button>
+            ) : null}
+            {fileCopy?.rightToLeft ? (
+              <Button type="button" size="sm" onClick={() => fileCopy.onCopy("right-to-left")}>
+                Copy right to left
+              </Button>
+            ) : null}
           </div>
         </div>
         {diff ? <DiffSummary diff={diff} /> : null}
@@ -85,18 +101,22 @@ export function FileDiffView({
                   <div key={`${hunkIndex}-${rowIndex}`}>
                     <div className="diff-grid hidden md:grid">
                       <span className="diff-gutter px-2 text-right">{row.leftLine ?? ""}</span>
-                      <span className={cellClass(row.change, "left")}>{row.leftText ?? ""}</span>
+                      <span className={cellClass(row.change, "left")}>
+                        <LineText text={row.leftText} spans={row.leftSpans} />
+                      </span>
                       <span className="diff-gutter px-2 text-right">{row.rightLine ?? ""}</span>
-                      <span className={cellClass(row.change, "right")}>{row.rightText ?? ""}</span>
+                      <span className={cellClass(row.change, "right")}>
+                        <LineText text={row.rightText} spans={row.rightSpans} />
+                      </span>
                     </div>
                     <div className="border-b border-border/70 md:hidden">
                       <div className={cellClass(row.change, "left")}>
                         <span className="diff-gutter mr-2 inline-block w-8 text-right">{row.leftLine ?? ""}</span>
-                        {row.leftText ?? (row.change === "insert" ? "" : "")}
+                        <LineText text={row.leftText} spans={row.leftSpans} />
                       </div>
                       <div className={cellClass(row.change, "right")}>
                         <span className="diff-gutter mr-2 inline-block w-8 text-right">{row.rightLine ?? ""}</span>
-                        {row.rightText ?? ""}
+                        <LineText text={row.rightText} spans={row.rightSpans} />
                       </div>
                     </div>
                   </div>
@@ -124,7 +144,20 @@ function DiffSummary({ diff }: { diff: FileDiffResult }) {
     );
   }
   if (diff.identical) {
-    return <p className="text-sm">These files match. {diff.counts.equal} lines are the same.</p>;
+    return (
+      <p className="text-sm">
+        These files match. {diff.counts.equal} lines are the same.
+        <EncodingNote diff={diff} />
+      </p>
+    );
+  }
+  if (diff.encodingsDiffer && diff.hunks.length === 0) {
+    return (
+      <p className="text-sm">
+        The line text matches. The files use different encodings ({labelEncoding(diff.leftEncoding)} and{" "}
+        {labelEncoding(diff.rightEncoding)}).
+      </p>
+    );
   }
   if (diff.lineEndingsDiffer) {
     return (
@@ -138,6 +171,11 @@ function DiffSummary({ diff }: { diff: FileDiffResult }) {
       <Count label="Change" value={diff.counts.change} className="diff-change" />
       <Count label="Insert" value={diff.counts.insert} className="diff-insert" />
       <Count label="Delete" value={diff.counts.delete} className="diff-delete" />
+      {diff.encodingsDiffer ? (
+        <span className="rounded-full border px-2 py-1 text-muted-foreground">
+          {labelEncoding(diff.leftEncoding)} / {labelEncoding(diff.rightEncoding)}
+        </span>
+      ) : null}
       {diff.truncated ? (
         <span className="rounded-full border px-2 py-1 text-muted-foreground">
           Truncated to the first 1,000,000 bytes
@@ -158,7 +196,10 @@ function Count({ label, value, className }: { label: string; value: number; clas
 function BinaryPanel({ diff }: { diff: FileDiffResult }) {
   return (
     <div className="space-y-3 px-4 py-6 text-sm">
-      <p>Binary files are not line-diffed. A null byte or bytes that are not valid UTF-8 is enough to stop the text view.</p>
+      <p>
+        Binary files are not line-diffed. A null byte or bytes that are not valid UTF-8 stops the text view. UTF-16
+        with a byte-order mark is shown as text.
+      </p>
       <dl className="max-w-3xl space-y-3 font-mono text-xs">
         <div className="flex flex-wrap gap-8">
           <div>
@@ -181,6 +222,29 @@ function BinaryPanel({ diff }: { diff: FileDiffResult }) {
       </dl>
     </div>
   );
+}
+
+function LineText({ text, spans }: { text: string | null; spans?: InlineSpan[] }) {
+  if (!spans || spans.length === 0) return <>{text ?? ""}</>;
+  return spans.map((span, index) => (
+    <span
+      key={`${span.change}-${index}`}
+      className={span.change === "delete" ? "diff-token-delete" : span.change === "insert" ? "diff-token-insert" : undefined}
+    >
+      {span.text}
+    </span>
+  ));
+}
+
+function EncodingNote({ diff }: { diff: FileDiffResult }) {
+  if (diff.leftEncoding === "utf-8" && diff.rightEncoding === "utf-8") return null;
+  return <span className="text-muted-foreground"> Read as {labelEncoding(diff.leftEncoding)}.</span>;
+}
+
+function labelEncoding(encoding: FileDiffResult["leftEncoding"]): string {
+  if (encoding === "utf-16le") return "UTF-16 LE";
+  if (encoding === "utf-16be") return "UTF-16 BE";
+  return "UTF-8";
 }
 
 function cellClass(change: LineChange, side: "left" | "right"): string {

@@ -165,3 +165,19 @@
 .diff-empty {
   background: oklch(0.955 0.006 85);
 }
+
+.diff-token-delete {
+  background: oklch(0.55 0.2 25);
+  color: white;
+  border-radius: 2px;
+  padding: 0 2px;
+  font-weight: 650;
+}
+
+.diff-token-insert {
+  background: oklch(0.48 0.14 150);
+  color: white;
+  border-radius: 2px;
+  padding: 0 2px;
+  font-weight: 650;
+}

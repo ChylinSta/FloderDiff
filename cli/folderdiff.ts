@@ -1,6 +1,6 @@
 import { parseArgs } from "node:util";
 
-import { CompareError, compareFolders, diffFiles } from "../lib/compare";
+import { CompareError, compareFolders, diffFiles, fileExitCode, folderExitCode } from "../lib/compare";
 import type { FileDiffResult, FolderCompareResult } from "../lib/compare";
 
 function usage(): void {
@@ -10,8 +10,10 @@ Usage:
   folderdiff dirs <left> <right> [--ignore pattern]... [--no-ignore] [--json]
   folderdiff files <left> <right> [--json]
 
-Exit code is 0 when the compare finishes, including when files differ.
-Exit code is 1 for usage errors and unreadable paths.
+Exit codes:
+  0  both sides match
+  1  usage error, or a root path is missing or unreadable
+  2  the compare finished and found a difference
 `);
 }
 
@@ -58,12 +60,14 @@ async function main(): Promise<void> {
     const result = await compareFolders(left, right, patterns);
     if (values.json) console.log(JSON.stringify(result, null, 2));
     else printFolders(result);
+    process.exitCode = folderExitCode(result);
     return;
   }
 
   const result = await diffFiles(left, right);
   if (values.json) console.log(JSON.stringify(result, null, 2));
   else printFiles(result, left, right);
+  process.exitCode = fileExitCode(result);
 }
 
 function printFolders(result: FolderCompareResult): void {

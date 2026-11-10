@@ -5,6 +5,7 @@ import { hashFile } from "./hash";
 import { compileIgnore } from "./ignore";
 import type {
   CompareEntry,
+  CompareProgress,
   FolderCompareResult,
   FolderSummary,
   SideStat,
@@ -12,17 +13,29 @@ import type {
 } from "./types";
 import { assertDirectory, walkTree } from "./walk";
 
+export type CompareOptions = {
+  signal?: AbortSignal;
+  onProgress?: (progress: CompareProgress) => void | Promise<void>;
+};
+
 export async function compareFolders(
   leftInput: string,
   rightInput: string,
   patterns?: string[],
+  options?: CompareOptions,
 ): Promise<FolderCompareResult> {
   const ignore = compileIgnore(patterns);
   const leftRoot = await assertDirectory(leftInput);
   const rightRoot = await assertDirectory(rightInput);
+  throwIfAborted(options?.signal);
+  let walked = 0;
+  const onVisit = async (relativePath: string) => {
+    walked += 1;
+    await options?.onProgress?.({ phase: "walk", done: walked, total: walked, path: relativePath });
+  };
   const [leftWalk, rightWalk] = await Promise.all([
-    walkTree(leftRoot, ignore),
-    walkTree(rightRoot, ignore),
+    walkTree(leftRoot, ignore, { signal: options?.signal, onVisit }),
+    walkTree(rightRoot, ignore, { signal: options?.signal, onVisit }),
   ]);
   const rootError = leftWalk.errors.get("") ?? rightWalk.errors.get("");
   if (rootError) {
@@ -38,25 +51,28 @@ export async function compareFolders(
   paths.delete("");
 
   const entries: CompareEntry[] = [];
+  const toHash: CompareEntry[] = [];
   for (const relativePath of paths) {
+    throwIfAborted(options?.signal);
     const left = leftWalk.entries.get(relativePath);
     const right = rightWalk.entries.get(relativePath);
     const error = joinErrors(
       leftWalk.errors.get(relativePath),
       rightWalk.errors.get(relativePath),
     );
-    entries.push(
-      await classifyPair({
-        relativePath,
-        left,
-        right,
-        leftRoot,
-        rightRoot,
-        error,
-      }),
-    );
+    const entry = classifyPair({
+      relativePath,
+      left,
+      right,
+      leftRoot,
+      rightRoot,
+      error,
+    });
+    if (left?.kind === "file" && right?.kind === "file") toHash.push(entry);
+    entries.push(entry);
   }
 
+  await hashFilePairs(toHash, options);
   rollupDirectories(entries);
   entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath, "en"));
 
@@ -69,14 +85,46 @@ export async function compareFolders(
   };
 }
 
-async function classifyPair(input: {
+async function hashFilePairs(entries: CompareEntry[], options?: CompareOptions): Promise<void> {
+  const total = entries.length;
+  await options?.onProgress?.({ phase: "hash", done: 0, total });
+  for (let index = 0; index < entries.length; index += 1) {
+    throwIfAborted(options?.signal);
+    const entry = entries[index];
+    if (!entry) continue;
+    await options?.onProgress?.({
+      phase: "hash",
+      done: index,
+      total,
+      path: entry.relativePath,
+    });
+    try {
+      const [leftHash, rightHash] = await Promise.all([
+        hashFile(entry.leftPath!),
+        hashFile(entry.rightPath!),
+      ]);
+      entry.leftHash = leftHash;
+      entry.rightHash = rightHash;
+      entry.status = leftHash === rightHash ? "same" : "different";
+    } catch (error) {
+      entry.status = "different";
+      entry.error = joinErrors(
+        entry.error,
+        error instanceof Error ? error.message : "Could not hash file",
+      );
+    }
+  }
+  await options?.onProgress?.({ phase: "hash", done: total, total });
+}
+
+function classifyPair(input: {
   relativePath: string;
   left?: WalkEntry;
   right?: WalkEntry;
   leftRoot: string;
   rightRoot: string;
   error?: string;
-}): Promise<CompareEntry> {
+}): CompareEntry {
   const { relativePath, left, right, leftRoot, rightRoot, error } = input;
   const name = path.posix.basename(relativePath);
   const base: CompareEntry = {
@@ -126,21 +174,7 @@ async function classifyPair(input: {
   }
 
   if (left.kind === "file" && right.kind === "file") {
-    try {
-      const [leftHash, rightHash] = await Promise.all([
-        hashFile(base.leftPath!),
-        hashFile(base.rightPath!),
-      ]);
-      base.leftHash = leftHash;
-      base.rightHash = rightHash;
-      base.status = leftHash === rightHash ? "same" : "different";
-    } catch (error) {
-      base.status = "different";
-      base.error = joinErrors(
-        base.error,
-        error instanceof Error ? error.message : "Could not hash file",
-      );
-    }
+    base.status = "different";
     return base;
   }
 
@@ -199,5 +233,9 @@ function toStat(entry: WalkEntry): SideStat {
 function joinErrors(left?: string, right?: string): string | undefined {
   const parts = [left, right].filter((part): part is string => Boolean(part));
   return parts.length ? parts.join(" | ") : undefined;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new CompareError("Compare cancelled.", 499);
 }
 

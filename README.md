@@ -8,7 +8,7 @@ This is an independent tool. It is not Beyond Compare and does not use that prod
 
 The interface is a local **Next.js** app (TypeScript, Tailwind, shadcn/ui). Comparison rules live in `lib/compare`, which the page, the HTTP routes, the CLI, and the tests all call.
 
-A localhost web app plus a Node CLI was chosen over Electron or Tauri so the project stays one language, has no native toolchain, and runs the same way on Linux and Windows: install Node.js, install dependencies, start the server. The server binds to **127.0.0.1** only. It can read any path your user can read, and it does not copy or delete files.
+A localhost web app plus a Node CLI was chosen over Electron or Tauri so the project stays one language, has no native toolchain, and runs the same way on Linux and Windows: install Node.js, install dependencies, start the server. The server binds to **127.0.0.1** only. It can read any path your user can read. Copying a file to the other side happens only after you confirm. It does not delete files.
 
 ## Requirements
 
@@ -58,9 +58,11 @@ npm run folderdiff -- files C:\compare\a.txt C:\compare\b.txt --json
 ## What you can do
 
 - Compare two folders recursively. Click a file to drill into it.
-- Compare two text files, with change, insert, and delete highlighting.
-- See a binary file called out as binary when it contains a null byte or is not valid UTF-8.
-- Refresh, copy a path, and open a path in the system default application (`xdg-open` on Linux, `start` on Windows, `open` on macOS).
+- Compare two text files, with change, insert, and delete highlighting. Changed words inside a line are marked as well as the whole line.
+- See a binary file called out as binary when it contains a null byte or is not valid UTF-8. UTF-16 LE and UTF-16 BE files that start with a byte-order mark are shown as text.
+- Refresh, copy a path, copy a file from one side to the other, and open a path in the system default application (`xdg-open` on Linux, `start` on Windows, `open` on macOS).
+- Watch folder compare progress (walking, then hashing) and cancel it. The page stays usable while that runs.
+- Paste a path, pick a recent path, and see whether the path is a folder, a file, or missing before you compare.
 - Filter the folder tree by name.
 - Ignore names such as `node_modules` or `.git`, or globs such as `*.log`. Defaults are `node_modules`, `.git`, and `.DS_Store`. Clear the ignore field to compare everything. `*.log` is not ignored until you add it.
 - Load the sample trees under `fixtures/left` and `fixtures/right`, or the sample text pair under `fixtures/files/`.
@@ -78,7 +80,15 @@ npm run folderdiff -- dirs fixtures/left fixtures/right --no-ignore
 npm run folderdiff -- files fixtures/files/left.txt fixtures/files/right.txt
 ```
 
-The process exits **0** when the compare finishes, even if files differ. It exits **1** for a usage error or a missing path.
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Both sides match. |
+| 1 | Usage error, or a root path is missing or unreadable. |
+| 2 | The compare finished and found a difference. Line-ending-only changes and unreadable entries inside a tree count as a difference. |
+
+`--json` still prints the result before the process exits. A script can read the JSON and also branch on the exit code.
 
 ## Tests
 
@@ -98,6 +108,7 @@ The design record for this version is in `.feature-dev/folder-diff-v1/`:
 - `testcases.md`
 - `verify.md`
 - `human_diff.md`
+- `iterate-1.md`
 
 ## License
 
