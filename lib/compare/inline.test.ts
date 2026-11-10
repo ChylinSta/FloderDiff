@@ -20,6 +20,18 @@ describe("inline highlight", () => {
     expect(spans.left.some((span) => span.change === "equal" && span.text.includes("const value"))).toBe(true);
   });
 
+  it("marks the changed character inside a token", () => {
+    const spans = inlineSpans("value1", "value2");
+    expect(spans.left).toEqual([
+      { change: "equal", text: "value" },
+      { change: "delete", text: "1" },
+    ]);
+    expect(spans.right).toEqual([
+      { change: "equal", text: "value" },
+      { change: "insert", text: "2" },
+    ]);
+  });
+
   it("attaches word spans to a changed diff row", async () => {
     const root = await mkdtemp(path.join(tmpdir(), "folderdiff-inline-"));
     cleanup.push(root);

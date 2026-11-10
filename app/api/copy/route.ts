@@ -1,4 +1,4 @@
-import { copyFileTo, resolveInsideRoot } from "@/lib/compare/copy";
+import { copyPath, resolveInsideRoot } from "@/lib/compare/copy";
 import { errorResponse } from "@/lib/compare/http";
 
 export async function POST(request: Request) {
@@ -31,7 +31,7 @@ export async function POST(request: Request) {
     if (!destination) {
       return Response.json({ error: "Provide a destination path, or a folder and a relative path." }, { status: 400 });
     }
-    const result = await copyFileTo(from, destination, overwrite);
+    const result = await copyPath(from, destination, overwrite);
     return Response.json(result);
   } catch (error) {
     return errorResponse(error);

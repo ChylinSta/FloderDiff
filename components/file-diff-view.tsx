@@ -25,6 +25,7 @@ export function FileDiffView({
   fileCopy?: {
     leftToRight: boolean;
     rightToLeft: boolean;
+    noun?: "file" | "folder";
     onCopy: (direction: "left-to-right" | "right-to-left") => void;
   };
 }) {
@@ -55,12 +56,12 @@ export function FileDiffView({
             </Button>
             {fileCopy?.leftToRight ? (
               <Button type="button" size="sm" onClick={() => fileCopy.onCopy("left-to-right")}>
-                Copy left to right
+                Copy {fileCopy.noun ?? "file"} left to right
               </Button>
             ) : null}
             {fileCopy?.rightToLeft ? (
               <Button type="button" size="sm" onClick={() => fileCopy.onCopy("right-to-left")}>
-                Copy right to left
+                Copy {fileCopy.noun ?? "file"} right to left
               </Button>
             ) : null}
           </div>
@@ -198,7 +199,7 @@ function BinaryPanel({ diff }: { diff: FileDiffResult }) {
     <div className="space-y-3 px-4 py-6 text-sm">
       <p>
         Binary files are not line-diffed. A null byte or bytes that are not valid UTF-8 stops the text view. UTF-16
-        with a byte-order mark is shown as text.
+        is shown as text when a byte-order mark is present, or when the bytes clearly look like even-length UTF-16.
       </p>
       <dl className="max-w-3xl space-y-3 font-mono text-xs">
         <div className="flex flex-wrap gap-8">

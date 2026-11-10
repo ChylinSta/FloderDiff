@@ -58,9 +58,9 @@ npm run folderdiff -- files C:\compare\a.txt C:\compare\b.txt --json
 ## What you can do
 
 - Compare two folders recursively. Click a file to drill into it.
-- Compare two text files, with change, insert, and delete highlighting. Changed words inside a line are marked as well as the whole line.
-- See a binary file called out as binary when it contains a null byte or is not valid UTF-8. UTF-16 LE and UTF-16 BE files that start with a byte-order mark are shown as text.
-- Refresh, copy a path, copy a file from one side to the other, and open a path in the system default application (`xdg-open` on Linux, `start` on Windows, `open` on macOS).
+- Compare two text files, with change, insert, and delete highlighting. Inside a changed word, only the changed characters are marked (`value1` versus `value2` highlights `1` and `2`).
+- See a binary file called out as binary when it contains a null byte or is not valid UTF-8. UTF-16 LE and UTF-16 BE are shown as text when a byte-order mark is present, or when the bytes are even-length and clearly look like ASCII stored as UTF-16. Other UTF-16, including text that is mostly not ASCII, stays binary.
+- Refresh, copy a path, copy a file or a selected folder from one side to the other, and open a path in the system default application (`xdg-open` on Linux, `start` on Windows, `open` on macOS). Copying a folder adds and overwrites files. It does not delete files that exist only on the destination, and it does not delete the source. Symlinks inside the folder are skipped.
 - Watch folder compare progress (walking, then hashing) and cancel it. The page stays usable while that runs.
 - Paste a path, pick a recent path, and see whether the path is a folder, a file, or missing before you compare.
 - Filter the folder tree by name.
@@ -90,6 +90,18 @@ Exit codes:
 
 `--json` still prints the result before the process exits. A script can read the JSON and also branch on the exit code.
 
+## Limits
+
+FolderDiff does not open the operating-system file dialog. **Browse** lists directories, and you can paste a path. A native picker would need a desktop shell, which this version does not include.
+
+The server is developed and checked on Linux. These Windows behaviors are implemented and untested on a Windows machine:
+
+- **Open** launches `cmd.exe /c start "" <path>`.
+- **Browse** looks for drive letters `A:\` through `Z:\`.
+- Creating a symlink in the automated tests is skipped when the OS refuses the link.
+
+Do not expose port 43123 beyond localhost. The process can read files as the user running Node, and it can copy a file or folder after you confirm.
+
 ## Tests
 
 ```bash
@@ -109,6 +121,7 @@ The design record for this version is in `.feature-dev/folder-diff-v1/`:
 - `verify.md`
 - `human_diff.md`
 - `iterate-1.md`
+- `iterate-2.md`
 
 ## License
 

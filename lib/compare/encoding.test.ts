@@ -73,4 +73,22 @@ describe("encoding detection", () => {
   it("keeps a null byte without a BOM binary", () => {
     expect(sniffEncoding(Buffer.from([0x00, 0x61]))).toBe("binary");
   });
+
+  it("decodes UTF-16 LE without a BOM when the null-byte pattern is clear", async () => {
+    const sample = Buffer.from("hello\n", "utf16le");
+    expect(sample.length % 2).toBe(0);
+    expect(sample.includes(0)).toBe(true);
+    expect(sniffEncoding(sample)).toBe("utf-16le");
+    expect(decodeSample(sample, "utf-16le")).toBe("hello\n");
+
+    const { left, right } = await files(sample, Buffer.from("hello!\n", "utf16le"));
+    const result = await diffFiles(left, right);
+    expect(result.kind).toBe("text");
+    expect(result.leftEncoding).toBe("utf-16le");
+    expect(result.hunks.flatMap((hunk) => hunk.rows).some((row) => row.change === "change")).toBe(true);
+  });
+
+  it("keeps mixed binary with a stray null as binary", () => {
+    expect(sniffEncoding(Buffer.from([0x01, 0x02, 0x00, 0x03, 0x04, 0x05, 0x06, 0x07]))).toBe("binary");
+  });
 });

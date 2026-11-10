@@ -1,6 +1,6 @@
 export { browseDirectory, platformRoots } from "./browse";
-export { copyFileTo, resolveInsideRoot } from "./copy";
-export { decodeSample, encodingLabel, sniffEncoding } from "./encoding";
+export { assertSafeCopy, copyFileTo, copyPath, copyTree, resolveInsideRoot } from "./copy";
+export { decodeSample, encodingLabel, sniffEncoding, sniffUtf16WithoutBom } from "./encoding";
 export { CompareError } from "./errors";
 export { fileExitCode, folderExitCode } from "./exit-code";
 export { fixturePaths } from "./fixtures";

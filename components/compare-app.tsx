@@ -167,24 +167,31 @@ export function CompareApp() {
         from,
         to,
         overwrite: true,
+        title: "Overwrite this file?",
         label: `Replace ${to} with the other file? This overwrites that path.`,
       });
       return;
     }
-    if (!selected || !folder || selected.type !== "file") return;
+    if (!selected || !folder || (selected.type !== "file" && selected.type !== "directory")) return;
     const from = direction === "left-to-right" ? selected.leftPath : selected.rightPath;
     const toRoot = direction === "left-to-right" ? folder.rightRoot : folder.leftRoot;
     const destinationExists = direction === "left-to-right" ? Boolean(selected.right) : Boolean(selected.left);
     if (!from) return;
     const side = direction === "left-to-right" ? "right" : "left";
+    const folderCopy = selected.type === "directory";
     setPendingCopy({
       from,
       toRoot,
       relativePath: selected.relativePath,
       overwrite: destinationExists,
-      label: destinationExists
-        ? `Replace ${selected.relativePath} on the ${side}? This overwrites that file.`
-        : `Copy ${selected.relativePath} to the ${side}? A new file will be created there.`,
+      title: folderCopy ? "Copy this folder?" : destinationExists ? "Overwrite this file?" : "Copy this file?",
+      label: folderCopy
+        ? destinationExists
+          ? `Copy the folder ${selected.relativePath} onto the ${side}? Files that already exist there are replaced. Files that exist only on the ${side} stay. The source folder is not deleted, and symlinks inside it are skipped.`
+          : `Copy the folder ${selected.relativePath} to the ${side}? New files will be created. The source folder is not deleted, and symlinks inside it are skipped.`
+        : destinationExists
+          ? `Replace ${selected.relativePath} on the ${side}? This overwrites that file.`
+          : `Copy ${selected.relativePath} to the ${side}? A new file will be created there.`,
     });
   }
 
@@ -194,7 +201,7 @@ export function CompareApp() {
     setPendingCopy(null);
     setError(null);
     try {
-      await postJson("/api/copy", {
+      const result = await postJson<CopyResponse>("/api/copy", {
         from: request.from,
         to: request.to,
         toRoot: request.toRoot,
@@ -202,7 +209,7 @@ export function CompareApp() {
         overwrite: request.overwrite,
       });
       const refreshed = await runCompare({ keepSelection: true });
-      if (refreshed) setNotice(request.overwrite ? "Replaced the destination file." : "Copied the file.");
+      if (refreshed) setNotice(describeCopy(result));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not copy that file.");
     }
@@ -500,6 +507,7 @@ export function CompareApp() {
                         ? {
                             leftToRight: fileCopy.leftToRight,
                             rightToLeft: fileCopy.rightToLeft,
+                            noun: fileCopy.noun,
                             onCopy: requestFileCopy,
                           }
                         : undefined
@@ -519,7 +527,7 @@ export function CompareApp() {
       <Dialog open={pendingCopy !== null} onOpenChange={(open) => { if (!open) setPendingCopy(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{pendingCopy?.overwrite ? "Overwrite this file?" : "Copy this file?"}</DialogTitle>
+            <DialogTitle>{pendingCopy?.title ?? "Copy?"}</DialogTitle>
             <DialogDescription>{pendingCopy?.label}</DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -623,15 +631,37 @@ function copyAffordances(
   diff: FileDiffResult | null,
   left: string,
   right: string,
-): { leftToRight: boolean; rightToLeft: boolean } | null {
+): { leftToRight: boolean; rightToLeft: boolean; noun?: "file" | "folder" } | null {
   if (mode === "files" && diff && !diff.identical && left.trim() && right.trim()) {
     return { leftToRight: true, rightToLeft: true };
   }
-  if (mode !== "folders" || !selected || selected.type !== "file" || selected.error) return null;
-  if (selected.status === "left-only") return { leftToRight: true, rightToLeft: false };
-  if (selected.status === "right-only") return { leftToRight: false, rightToLeft: true };
-  if (selected.status === "different") return { leftToRight: true, rightToLeft: true };
+  if (mode !== "folders" || !selected || selected.error) return null;
+  if (selected.type !== "file" && selected.type !== "directory") return null;
+  const noun = selected.type === "directory" ? "folder" : "file";
+  if (selected.status === "left-only") return { leftToRight: true, rightToLeft: false, noun };
+  if (selected.status === "right-only") return { leftToRight: false, rightToLeft: true, noun };
+  if (selected.status === "different") return { leftToRight: true, rightToLeft: true, noun };
   return null;
+}
+
+type CopyResponse = {
+  filesCopied?: number;
+  skippedSymlinks?: number;
+  skippedSpecial?: number;
+  overwritten?: boolean;
+};
+
+function describeCopy(result: CopyResponse): string {
+  const files = result.filesCopied ?? 0;
+  const parts = [`Copied ${files} file${files === 1 ? "" : "s"}.`];
+  if (result.overwritten) parts.unshift("Replaced existing files.");
+  if (result.skippedSymlinks) {
+    parts.push(`Skipped ${result.skippedSymlinks} symlink${result.skippedSymlinks === 1 ? "" : "s"}.`);
+  }
+  if (result.skippedSpecial) {
+    parts.push(`Skipped ${result.skippedSpecial} special file${result.skippedSpecial === 1 ? "" : "s"}.`);
+  }
+  return parts.join(" ");
 }
 
 function EmptyState({ onFolders, onFiles }: { onFolders: () => void; onFiles: () => void }) {
@@ -863,5 +893,6 @@ type PendingCopy = {
   toRoot?: string;
   relativePath?: string;
   overwrite: boolean;
+  title: string;
   label: string;
 };
