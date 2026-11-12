@@ -1,0 +1,8 @@
+alpha
+BETA
+gamma
+epsilon
+zeta
+eta
+theta
+iota
