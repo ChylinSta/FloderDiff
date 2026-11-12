@@ -79,3 +79,11 @@ Re-checked in the browser after that change: the sample text diff spans the cont
 
 - Windows `cmd.exe /c start` was not executed. The spawn path is the one in `lib/compare/open.ts`. Linux `xdg-open` did launch.
 - A multi-gigabyte tree was not walked. Hashes are streamed, but a huge directory will hold the HTTP request until the walk finishes.
+
+## Iterate 4 (2026-11-12, Linux)
+
+`npm test` — 75 passing. New cases cover copy cancel rollback (new files removed, overwritten files restored, destination-only files put back, a partial copy named when rollback cannot delete), Windows path paste (`C:\Users\me\compare\left`, `C:/Users/me/compare/left`, `D:\data`, quoted paths), drive-letter listing with a stand-in `exists` check, `cmd.exe /c start "" <path>` via a mocked `spawn`, short ASCII UTF-16 without a BOM, and ambiguous UTF-16 endianness staying undecided.
+
+Browser on Linux at `http://127.0.0.1:43123`: the folder confirm dialog says a cancel removes files that copy created and restores files it overwrote. After copying `src` from the sample tree, the page showed `Copied 3 files.` and `Finished hashing 7 / 7`, and the copying line was gone. Canceling a later copy while it said `Planning copy` showed `Copy cancelled. Nothing from this copy was left on the destination.` The destination-only `keep.txt` was still there.
+
+Not run on a Windows machine: Open (`cmd.exe`), drive-letter browse (`A:\`–`Z:\`), and `start.cmd`. The Windows opener was not launched; the test only checks the argument list.

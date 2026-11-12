@@ -4,11 +4,12 @@ import os from "node:os";
 import path from "node:path";
 
 import { CompareError } from "./errors";
+import { normalizeUserPath } from "./paths";
 import type { BrowseResult, NodeKind } from "./types";
 
 export async function browseDirectory(input: string | null | undefined): Promise<BrowseResult> {
   const roots = platformRoots();
-  const requested = input?.trim() ? path.resolve(input) : os.homedir();
+  const requested = input?.trim() ? normalizeUserPath(input) : os.homedir();
   let info;
   try {
     info = await stat(requested);
@@ -57,12 +58,18 @@ function kindFromDirent(dirent: { isSymbolicLink(): boolean; isDirectory(): bool
   return "other";
 }
 
-export function platformRoots(): string[] {
-  if (process.platform === "win32") {
+export function platformRoots(options?: {
+  platform?: NodeJS.Platform;
+  exists?: (candidate: string) => boolean;
+}): string[] {
+  const platform = options?.platform ?? process.platform;
+  const exists = options?.exists ?? existsSync;
+  if (platform === "win32") {
     const roots: string[] = [];
     for (let code = 65; code <= 90; code += 1) {
-      const root = `${String.fromCharCode(code)}:\\`;
-      if (existsSync(root)) roots.push(root);
+      const letter = String.fromCharCode(code);
+      const root = `${letter}:\\`;
+      if (exists(root) || exists(`${letter}:/`)) roots.push(root);
     }
     return roots.length > 0 ? roots : ["C:\\"];
   }

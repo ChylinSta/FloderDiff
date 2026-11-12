@@ -1,4 +1,4 @@
-import { CompareError, copyPath, resolveInsideRoot } from "@/lib/compare";
+import { CompareError, CopyCancelledError, beginCopy, copyPath, isCopyId, resolveInsideRoot } from "@/lib/compare";
 
 export async function POST(request: Request) {
   let body: unknown;
@@ -13,6 +13,9 @@ export async function POST(request: Request) {
   const record = body as Record<string, unknown>;
   if (typeof record.from !== "string" || typeof record.overwrite !== "boolean") {
     return Response.json({ error: "from and overwrite are required." }, { status: 400 });
+  }
+  if (record.copyId !== undefined && (typeof record.copyId !== "string" || !isCopyId(record.copyId))) {
+    return Response.json({ error: "copyId is invalid." }, { status: 400 });
   }
   let destination: string;
   try {
@@ -31,6 +34,7 @@ export async function POST(request: Request) {
     return Response.json({ error: "Provide a destination path, or a folder and a relative path." }, { status: 400 });
   }
 
+  const session = beginCopy(typeof record.copyId === "string" ? record.copyId : undefined, request.signal);
   const encoder = new TextEncoder();
   let closed = false;
   const stream = new ReadableStream({
@@ -47,7 +51,7 @@ export async function POST(request: Request) {
           copySymlinks: record.copySymlinks === true,
           sourceRoot: typeof record.sourceRoot === "string" ? record.sourceRoot : undefined,
           destRoot: typeof record.destRoot === "string" ? record.destRoot : undefined,
-          signal: request.signal,
+          signal: session.signal,
           onProgress: async (progress) => {
             const now = Date.now();
             const finished = progress.done === progress.total && progress.total > 0;
@@ -59,14 +63,33 @@ export async function POST(request: Request) {
         });
         send({ type: "result", result });
       } catch (error) {
-        if (request.signal.aborted) return;
-        const message = error instanceof CompareError ? error.message : "Unexpected error while copying.";
-        if (!(error instanceof CompareError)) console.error(error);
-        send({ type: "error", error: message });
+        if (error instanceof CopyCancelledError) {
+          send({
+            type: "cancelled",
+            error: error.message,
+            removed: error.report.removed,
+            restored: error.report.restored,
+            partial: error.report.partial,
+          });
+        } else if (request.signal.aborted) {
+          return;
+        } else {
+          const message = error instanceof CompareError ? error.message : "Unexpected error while copying.";
+          if (!(error instanceof CompareError)) console.error(error);
+          send({ type: "error", error: message });
+        }
       } finally {
+        session.finish();
         closed = true;
-        controller.close();
+        try {
+          controller.close();
+        } catch {
+          // The client may already have closed the stream.
+        }
       }
+    },
+    cancel() {
+      session.finish();
     },
   });
 
