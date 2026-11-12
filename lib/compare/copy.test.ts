@@ -1,9 +1,10 @@
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { assertSafeCopy, copyFileTo, copyPath, resolveInsideRoot } from "./copy";
+import { assertSafeCopy, copyFileTo, copyPath, previewCopy, resolveInsideRoot } from "./copy";
+import type { CopyProgress } from "./copy";
 import { CompareError } from "./errors";
 
 const cleanup: string[] = [];
@@ -11,6 +12,15 @@ const cleanup: string[] = [];
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
+
+async function readdirSafe(directory: string): Promise<string[]> {
+  try {
+    const { readdir } = await import("node:fs/promises");
+    return await readdir(directory);
+  } catch {
+    return [];
+  }
+}
 
 describe("copy between sides", () => {
   it("creates a missing destination and refuses to overwrite until asked", async () => {
@@ -93,6 +103,122 @@ describe("copy between sides", () => {
     expect(copied.skippedSymlinks).toBe(1);
     await expect(readFile(path.join(root, "right", "link.txt"))).rejects.toThrow();
     expect(await readFile(path.join(root, "right", "real.txt"), "utf8")).toBe("real\n");
+  });
+
+  it("reports copy progress and can cancel before every file is written", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "folderdiff-tree-progress-"));
+    cleanup.push(root);
+    const source = path.join(root, "left");
+    const destination = path.join(root, "right");
+    await mkdir(source);
+    await writeFile(path.join(source, "a.txt"), "a\n");
+    await writeFile(path.join(source, "b.txt"), "b\n");
+    await writeFile(path.join(source, "c.txt"), "c\n");
+    const events: CopyProgress[] = [];
+    await copyPath(source, destination, {
+      overwrite: true,
+      onProgress: (progress) => {
+        events.push({ ...progress });
+      },
+    });
+    const copies = events.filter((event) => event.phase === "copy");
+    expect(copies.at(-1)).toMatchObject({ done: 3, total: 3 });
+    expect(copies.some((event) => event.path === "a.txt" || event.path === "b.txt" || event.path === "c.txt")).toBe(true);
+
+    const again = path.join(root, "again");
+    const controller = new AbortController();
+    await expect(
+      copyPath(source, again, {
+        overwrite: true,
+        signal: controller.signal,
+        onProgress: (progress) => {
+          if (progress.phase === "copy" && progress.done === 1) controller.abort();
+        },
+      }),
+    ).rejects.toThrow(/cancelled/i);
+    const copiedNames = await readdirSafe(again);
+    expect(copiedNames.length).toBeLessThan(3);
+  });
+
+  it("removes destination-only files only when mirror is requested", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "folderdiff-tree-mirror-"));
+    cleanup.push(root);
+    const source = path.join(root, "left");
+    const destination = path.join(root, "right");
+    await mkdir(path.join(source, "keep"), { recursive: true });
+    await mkdir(path.join(destination, "keep"), { recursive: true });
+    await mkdir(path.join(destination, "only"), { recursive: true });
+    await writeFile(path.join(source, "keep", "a.txt"), "a\n");
+    await writeFile(path.join(destination, "keep", "a.txt"), "old\n");
+    await writeFile(path.join(destination, "only", "extra.txt"), "extra\n");
+    await writeFile(path.join(destination, "keep", "stay-without-mirror.txt"), "stay\n");
+
+    const preview = await previewCopy(source, destination, { overwrite: true, mirror: true });
+    expect(preview.deletions.map((item) => item.relativePath).sort()).toEqual([
+      "keep/stay-without-mirror.txt",
+      "only",
+      "only/extra.txt",
+    ]);
+    expect(preview.filesToOverwrite).toBe(1);
+
+    await copyPath(source, destination, { overwrite: true, mirror: false });
+    expect(await readFile(path.join(destination, "only", "extra.txt"), "utf8")).toBe("extra\n");
+
+    const mirrored = await copyPath(source, destination, { overwrite: true, mirror: true });
+    expect(mirrored.deleted).toBe(3);
+    expect(await readFile(path.join(destination, "keep", "a.txt"), "utf8")).toBe("a\n");
+    expect(await readFile(path.join(source, "keep", "a.txt"), "utf8")).toBe("a\n");
+    await expect(readFile(path.join(destination, "only", "extra.txt"))).rejects.toThrow();
+  });
+
+  it("does not follow a destination symlink when mirroring", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "folderdiff-tree-mirror-link-"));
+    cleanup.push(root);
+    const source = path.join(root, "left");
+    const destination = path.join(root, "right");
+    const outside = path.join(root, "secret.txt");
+    await mkdir(source);
+    await mkdir(destination);
+    await writeFile(path.join(source, "a.txt"), "a\n");
+    await writeFile(outside, "secret\n");
+    try {
+      await symlink(outside, path.join(destination, "escape"));
+    } catch {
+      expect(process.platform).toBe("win32");
+      return;
+    }
+    await copyPath(source, destination, { overwrite: true, mirror: true, sourceRoot: source, destRoot: destination });
+    await expect(lstat(path.join(destination, "escape"))).rejects.toThrow();
+    expect(await readFile(outside, "utf8")).toBe("secret\n");
+  });
+
+  it("recreates an inside symlink and skips one that leaves the compare root", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "folderdiff-tree-relink-"));
+    cleanup.push(root);
+    const source = path.join(root, "left");
+    const destination = path.join(root, "right");
+    const outside = path.join(root, "outside.txt");
+    await mkdir(source);
+    await writeFile(path.join(source, "real.txt"), "real\n");
+    await writeFile(outside, "out\n");
+    try {
+      await symlink("real.txt", path.join(source, "inside"));
+      await symlink(outside, path.join(source, "outside"));
+    } catch {
+      expect(process.platform).toBe("win32");
+      return;
+    }
+    const copied = await copyPath(source, destination, {
+      overwrite: true,
+      copySymlinks: true,
+      sourceRoot: source,
+      destRoot: destination,
+    });
+    expect(copied.symlinksCopied).toBe(1);
+    expect(copied.skippedSymlinks).toBe(1);
+    expect(await readlink(path.join(destination, "inside"))).toBe("real.txt");
+    await expect(lstat(path.join(destination, "outside"))).rejects.toThrow();
+    expect(await readFile(outside, "utf8")).toBe("out\n");
   });
 
   it("refuses to copy a folder into itself or onto a drive root", async () => {

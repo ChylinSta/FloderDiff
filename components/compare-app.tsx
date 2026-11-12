@@ -52,6 +52,10 @@ export function CompareApp() {
   const [mobilePane, setMobilePane] = useState<"tree" | "diff">("tree");
   const [fixtures, setFixtures] = useState<FixturePaths | null>(null);
   const [progress, setProgress] = useState<CompareProgress | null>(null);
+  const [copyProgress, setCopyProgress] = useState<CopyProgress | null>(null);
+  const [mirrorCopy, setMirrorCopy] = useState(false);
+  const [copyLinks, setCopyLinks] = useState(false);
+  const [copyPreview, setCopyPreview] = useState<CopyPlan | null>(null);
   const [recent, setRecent] = useState<string[]>([]);
   const [pendingCopy, setPendingCopy] = useState<PendingCopy | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -82,7 +86,7 @@ export function CompareApp() {
 
   const selected = folder?.entries.find((entry) => entry.relativePath === selectedPath) ?? null;
 
-  async function runCompare(overrides?: { mode?: Mode; left?: string; right?: string; keepSelection?: boolean }): Promise<boolean> {
+  async function runCompare(overrides?: { mode?: Mode; left?: string; right?: string; keepSelection?: boolean; keepCopyStatus?: boolean }): Promise<boolean> {
     const nextMode = overrides?.mode ?? mode;
     const nextLeft = (overrides?.left ?? left).trim();
     const nextRight = (overrides?.right ?? right).trim();
@@ -94,6 +98,7 @@ export function CompareApp() {
     const controller = new AbortController();
     abortRef.current = controller;
     setLoading(true);
+    if (!overrides?.keepCopyStatus) setCopyProgress(null);
     setProgress(null);
     setError(null);
     setNotice(null);
@@ -167,6 +172,7 @@ export function CompareApp() {
         from,
         to,
         overwrite: true,
+        kind: "file",
         title: "Overwrite this file?",
         label: `Replace ${to} with the other file? This overwrites that path.`,
       });
@@ -175,43 +181,109 @@ export function CompareApp() {
     if (!selected || !folder || (selected.type !== "file" && selected.type !== "directory")) return;
     const from = direction === "left-to-right" ? selected.leftPath : selected.rightPath;
     const toRoot = direction === "left-to-right" ? folder.rightRoot : folder.leftRoot;
+    const sourceRoot = direction === "left-to-right" ? folder.leftRoot : folder.rightRoot;
     const destinationExists = direction === "left-to-right" ? Boolean(selected.right) : Boolean(selected.left);
     if (!from) return;
     const side = direction === "left-to-right" ? "right" : "left";
     const folderCopy = selected.type === "directory";
+    setMirrorCopy(false);
+    setCopyLinks(false);
+    setCopyPreview(null);
     setPendingCopy({
       from,
       toRoot,
+      sourceRoot,
+      destRoot: toRoot,
       relativePath: selected.relativePath,
       overwrite: destinationExists,
+      kind: folderCopy ? "directory" : "file",
       title: folderCopy ? "Copy this folder?" : destinationExists ? "Overwrite this file?" : "Copy this file?",
       label: folderCopy
-        ? destinationExists
-          ? `Copy the folder ${selected.relativePath} onto the ${side}? Files that already exist there are replaced. Files that exist only on the ${side} stay. The source folder is not deleted, and symlinks inside it are skipped.`
-          : `Copy the folder ${selected.relativePath} to the ${side}? New files will be created. The source folder is not deleted, and symlinks inside it are skipped.`
+        ? `Copy the folder ${selected.relativePath} to the ${side}? The source folder is not deleted.`
         : destinationExists
-          ? `Replace ${selected.relativePath} on the ${side}? This overwrites that file.`
+          ? `Replace ${selected.relativePath} on the ${side}? This overwrites that file. The source is not deleted.`
           : `Copy ${selected.relativePath} to the ${side}? A new file will be created there.`,
     });
   }
 
+  useEffect(() => {
+    if (!pendingCopy || pendingCopy.kind !== "directory") return;
+    const request = pendingCopy;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      void postJson<CopyPlan>("/api/copy/preview", {
+        from: request.from,
+        toRoot: request.toRoot,
+        relativePath: request.relativePath,
+        overwrite: request.overwrite || mirrorCopy,
+        mirror: mirrorCopy,
+        copySymlinks: copyLinks,
+        sourceRoot: request.sourceRoot,
+        destRoot: request.destRoot,
+      })
+        .then((plan) => {
+          if (!cancelled) setCopyPreview(plan);
+        })
+        .catch((caught: unknown) => {
+          if (!cancelled) setError(caught instanceof Error ? caught.message : "Could not preview that copy.");
+        });
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [pendingCopy, mirrorCopy, copyLinks]);
+
   async function confirmCopy() {
     if (!pendingCopy) return;
     const request = pendingCopy;
+    const mirror = request.kind === "directory" && mirrorCopy;
+    const recreateLinks = request.kind === "directory" && copyLinks;
     setPendingCopy(null);
     setError(null);
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setLoading(true);
+    setProgress(null);
+    setCopyProgress({ phase: "copy", done: 0, total: 0, path: request.relativePath });
     try {
-      const result = await postJson<CopyResponse>("/api/copy", {
-        from: request.from,
-        to: request.to,
-        toRoot: request.toRoot,
-        relativePath: request.relativePath,
-        overwrite: request.overwrite,
+      const result = await streamCopy(
+        {
+          from: request.from,
+          to: request.to,
+          toRoot: request.toRoot,
+          relativePath: request.relativePath,
+          overwrite: request.overwrite || mirror,
+          mirror,
+          copySymlinks: recreateLinks,
+          sourceRoot: request.sourceRoot,
+          destRoot: request.destRoot,
+        },
+        { signal: controller.signal, onProgress: setCopyProgress },
+      );
+      if (controller.signal.aborted) return;
+      const copied = result.filesCopied ?? 0;
+      const removed = result.deleted ?? 0;
+      setCopyProgress({
+        phase: "copy",
+        done: copied,
+        total: Math.max(copied, 1),
+        path: removed > 0 ? `removed ${removed} destination-only` : request.relativePath,
       });
-      const refreshed = await runCompare({ keepSelection: true });
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const refreshed = await runCompare({ keepSelection: true, keepCopyStatus: true });
       if (refreshed) setNotice(describeCopy(result));
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not copy that file.");
+      if (isAbort(caught) || controller.signal.aborted) {
+        setCopyProgress(null);
+        await runCompare({ keepSelection: true, keepCopyStatus: true });
+        setNotice("Copy cancelled. Files already copied stay on the destination.");
+        return;
+      }
+      setCopyProgress(null);
+      setLoading(false);
+      setError(caught instanceof Error ? caught.message : "Could not copy that path.");
     }
   }
 
@@ -320,6 +392,20 @@ export function CompareApp() {
         </div>
       </header>
 
+      {copyProgress ? (
+        <div className="sticky top-0 z-30 flex flex-wrap items-center gap-3 border-b bg-primary px-4 py-2 text-sm text-primary-foreground" role="status">
+          <span>
+            {copyProgress.phase === "delete" ? "Removing" : copyProgress.phase === "plan" ? "Planning copy" : "Copying"}
+            {copyProgress.total > 0 ? ` ${copyProgress.done} / ${copyProgress.total}` : ""}
+          </span>
+          {copyProgress.path ? <span className="min-w-0 flex-1 truncate font-mono text-xs opacity-90">{copyProgress.path}</span> : null}
+          {loading && !progress ? (
+            <Button type="button" size="sm" variant="secondary" onClick={cancelCompare}>
+              Cancel
+            </Button>
+          ) : null}
+        </div>
+      ) : null}
       {progress ? (
         <div className="sticky top-0 z-30 flex flex-wrap items-center gap-3 border-b bg-primary px-4 py-2 text-sm text-primary-foreground" role="status">
           <span>
@@ -521,7 +607,7 @@ export function CompareApp() {
       </div>
 
       <footer className="border-t px-4 py-2 text-[11px] text-muted-foreground">
-        FolderDiff reads files for the account running this server, and copies a file only after you confirm. It listens on 127.0.0.1 and does not delete files.
+        FolderDiff reads files for the account running this server. It copies, and can remove destination-only files, only after you confirm. It listens on 127.0.0.1.
       </footer>
 
       <Dialog open={pendingCopy !== null} onOpenChange={(open) => { if (!open) setPendingCopy(null); }}>
@@ -530,6 +616,63 @@ export function CompareApp() {
             <DialogTitle>{pendingCopy?.title ?? "Copy?"}</DialogTitle>
             <DialogDescription>{pendingCopy?.label}</DialogDescription>
           </DialogHeader>
+          {pendingCopy?.kind === "directory" ? (
+            <div className="space-y-3 text-sm">
+              <label className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={mirrorCopy}
+                  onChange={(event) => {
+                    setMirrorCopy(event.target.checked);
+                    setCopyPreview(null);
+                  }}
+                />
+                <span>Also remove files and folders that exist only on the destination.</span>
+              </label>
+              <label className="flex items-start gap-2">
+                <input
+                  type="checkbox"
+                  className="mt-1"
+                  checked={copyLinks}
+                  onChange={(event) => {
+                    setCopyLinks(event.target.checked);
+                    setCopyPreview(null);
+                  }}
+                />
+                <span>
+                  Recreate symlinks whose targets stay inside this compare. Links that point outside, or whose target is missing, are skipped and not followed.
+                </span>
+              </label>
+              {mirrorCopy ? (
+                <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 text-destructive">
+                  <p>
+                    {copyPreview
+                      ? `This will delete ${copyPreview.deletions.length} item${copyPreview.deletions.length === 1 ? "" : "s"} that exist${copyPreview.deletions.length === 1 ? "s" : ""} only on the destination.`
+                      : "Checking what would be deleted…"}
+                    {" "}FolderDiff cannot undo that.
+                  </p>
+                  {copyPreview && copyPreview.deletions.length > 0 ? (
+                    <ul className="mt-2 list-disc pl-4 font-mono text-xs">
+                      {copyPreview.deletions.slice(0, 6).map((item) => (
+                        <li key={item.relativePath}>{item.relativePath}</li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {copyPreview && copyPreview.deletions.length > 6 ? (
+                    <p className="mt-1 text-xs">and {copyPreview.deletions.length - 6} more</p>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="text-muted-foreground">Files that exist only on the destination stay.</p>
+              )}
+              {copyLinks && copyPreview ? (
+                <p className="text-muted-foreground">
+                  Will recreate {copyPreview.symlinksToCopy} symlink{copyPreview.symlinksToCopy === 1 ? "" : "s"}. Skipping {copyPreview.skippedSymlinks.length} that leave the compare or are missing.
+                </p>
+              ) : null}
+            </div>
+          ) : null}
           <DialogFooter>
             <Button type="button" variant="outline" onClick={() => setPendingCopy(null)}>
               Cancel
@@ -644,17 +787,15 @@ function copyAffordances(
   return null;
 }
 
-type CopyResponse = {
-  filesCopied?: number;
-  skippedSymlinks?: number;
-  skippedSpecial?: number;
-  overwritten?: boolean;
-};
-
 function describeCopy(result: CopyResponse): string {
   const files = result.filesCopied ?? 0;
   const parts = [`Copied ${files} file${files === 1 ? "" : "s"}.`];
-  if (result.overwritten) parts.unshift("Replaced existing files.");
+  if (result.symlinksCopied) {
+    parts.push(`Recreated ${result.symlinksCopied} symlink${result.symlinksCopied === 1 ? "" : "s"}.`);
+  }
+  if (result.deleted) {
+    parts.push(`Removed ${result.deleted} destination-only item${result.deleted === 1 ? "" : "s"}.`);
+  }
   if (result.skippedSymlinks) {
     parts.push(`Skipped ${result.skippedSymlinks} symlink${result.skippedSymlinks === 1 ? "" : "s"}.`);
   }
@@ -858,6 +999,50 @@ async function streamCompare(
   return result;
 }
 
+async function streamCopy(
+  body: Record<string, unknown>,
+  options: { signal: AbortSignal; onProgress: (progress: CopyProgress) => void },
+): Promise<CopyResponse> {
+  const response = await fetch("/api/copy", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal: options.signal,
+  });
+  if (!response.ok || !response.body) {
+    const payload = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(payload.error ?? `Request failed (${response.status}).`);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: CopyResponse | null = null;
+  let latest: CopyProgress | null = null;
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const event = JSON.parse(line) as { type: string; error?: string; result?: CopyResponse } & CopyProgress;
+      if (event.type === "progress") latest = event;
+      else if (event.type === "error") throw new Error(event.error ?? "Copy failed.");
+      else if (event.result) result = event.result;
+    }
+    if (latest) {
+      options.onProgress(latest);
+      latest = null;
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      });
+    }
+  }
+  if (!result) throw new Error("The copy ended before a result was ready.");
+  return result;
+}
+
 function isAbort(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
 }
@@ -891,8 +1076,35 @@ type PendingCopy = {
   from: string;
   to?: string;
   toRoot?: string;
+  sourceRoot?: string;
+  destRoot?: string;
   relativePath?: string;
   overwrite: boolean;
+  kind: "file" | "directory";
   title: string;
   label: string;
+};
+
+type CopyProgress = {
+  phase: "plan" | "copy" | "delete";
+  done: number;
+  total: number;
+  path?: string;
+};
+
+type CopyPlan = {
+  filesToCopy: number;
+  filesToOverwrite: number;
+  symlinksToCopy: number;
+  skippedSymlinks: Array<{ path: string; reason: string }>;
+  deletions: Array<{ relativePath: string; kind: string }>;
+};
+
+type CopyResponse = {
+  filesCopied?: number;
+  skippedSymlinks?: number;
+  skippedSpecial?: number;
+  symlinksCopied?: number;
+  deleted?: number;
+  overwritten?: boolean;
 };

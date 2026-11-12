@@ -91,4 +91,48 @@ describe("encoding detection", () => {
   it("keeps mixed binary with a stray null as binary", () => {
     expect(sniffEncoding(Buffer.from([0x01, 0x02, 0x00, 0x03, 0x04, 0x05, 0x06, 0x07]))).toBe("binary");
   });
+
+  it("decodes Chinese UTF-16 LE and BE fixtures without a BOM", async () => {
+    const text = "你好，世界。\n文件夹比较。\n";
+    const le = Buffer.from(text, "utf16le");
+    const be = swapUtf16(le);
+    expect(sniffEncoding(le)).toBe("utf-16le");
+    expect(sniffEncoding(be)).toBe("utf-16be");
+    expect(decodeSample(le, "utf-16le")).toBe(text);
+    expect(decodeSample(be, "utf-16be")).toBe(text);
+
+    const fixtureLe = await readFixture("zh-utf16le.txt");
+    const fixtureBe = await readFixture("zh-utf16be.txt");
+    expect(sniffEncoding(fixtureLe)).toBe("utf-16le");
+    expect(sniffEncoding(fixtureBe)).toBe("utf-16be");
+    expect(decodeSample(fixtureLe, "utf-16le")).toBe(text);
+
+    const { left, right } = await files(le, be);
+    const result = await diffFiles(left, right);
+    expect(result.kind).toBe("text");
+    expect(result.identical).toBe(false);
+    expect(result.encodingsDiffer).toBe(true);
+    expect(result.hunks).toHaveLength(0);
+  });
+
+  it("keeps UTF-8 Chinese and odd-length binary as themselves", () => {
+    const utf8 = Buffer.from("你好，世界。文件夹比较还要更长一点。\n", "utf8");
+    expect(sniffEncoding(utf8)).toBe("utf-8");
+    expect(sniffEncoding(Buffer.from([0x00, 0x41, 0x00]))).toBe("binary");
+    expect(sniffEncoding(Buffer.alloc(16, 0xff))).toBe("binary");
+  });
 });
+
+function swapUtf16(le: Buffer): Buffer {
+  const be = Buffer.alloc(le.length);
+  for (let index = 0; index < le.length; index += 2) {
+    be[index] = le[index + 1] ?? 0;
+    be[index + 1] = le[index] ?? 0;
+  }
+  return be;
+}
+
+async function readFixture(name: string): Promise<Buffer> {
+  const { readFile } = await import("node:fs/promises");
+  return readFile(path.resolve("fixtures/files", name));
+}

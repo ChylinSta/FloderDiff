@@ -30,6 +30,7 @@ export function BrowseDialog({
   const [current, setCurrent] = useState<string | null>(null);
   const [pasted, setPasted] = useState("");
   const [fileCandidate, setFileCandidate] = useState<string | null>(null);
+  const [recentFolders, setRecentFolders] = useState<string[]>([]);
 
   useEffect(() => {
     if (!open) return;
@@ -43,7 +44,11 @@ export function BrowseDialog({
         const response = await fetch(`/api/browse${query}`, { cache: "no-store" });
         const body = (await response.json()) as BrowseResult & { error?: string };
         if (!response.ok) throw new Error(body.error ?? "Could not list that folder.");
-        if (!cancelled) setListing(body);
+        if (!cancelled) {
+          setListing(body);
+          setPasted(body.path);
+          setRecentFolders(rememberFolder(body.path));
+        }
       } catch (caught) {
         if (!cancelled) {
           setError(caught instanceof Error ? caught.message : "Could not list that folder.");
@@ -62,6 +67,7 @@ export function BrowseDialog({
     <Dialog
       open={open}
       onOpenChange={(next) => {
+        if (next) setRecentFolders(readFolders());
         if (!next) setCurrent(null);
         onOpenChange(next);
       }}
@@ -70,7 +76,7 @@ export function BrowseDialog({
         <DialogHeader>
           <DialogTitle>Browse this machine</DialogTitle>
           <DialogDescription>
-            Paste a path or pick a folder. FolderDiff only lists paths your user can read.
+            Type or paste a full path, then Go. This listing is not the operating-system file dialog.
           </DialogDescription>
         </DialogHeader>
         <form
@@ -83,7 +89,7 @@ export function BrowseDialog({
           <Input
             value={pasted}
             onChange={(event) => setPasted(event.target.value)}
-            placeholder="Paste a path"
+            placeholder="Type or paste a full path"
             className="font-mono"
             spellCheck={false}
             aria-label="Path to open"
@@ -101,6 +107,18 @@ export function BrowseDialog({
             <Button type="button" size="xs" variant="outline" onClick={() => onPick(fileCandidate, "file", "right")}>
               Use as right
             </Button>
+          </div>
+        ) : null}
+        {recentFolders.length > 0 ? (
+          <div className="space-y-1">
+            <p className="text-xs font-medium text-muted-foreground">Recent folders</p>
+            <div className="flex flex-wrap gap-1">
+              {recentFolders.map((path) => (
+                <Button key={path} type="button" size="xs" variant="outline" className="max-w-full" onClick={() => void goTo(path, setCurrent, setFileCandidate, setError)}>
+                  <span className="truncate font-mono">{path}</span>
+                </Button>
+              ))}
+            </div>
           </div>
         ) : null}
         {recent.length > 0 ? (
@@ -220,6 +238,25 @@ async function goTo(raw: string, setCurrent: (path: string) => void, setFileCand
   }
   setFileCandidate(null);
   setCurrent(body.path);
+}
+
+const FOLDER_KEY = "folderdiff-recent-folders";
+
+function readFolders(): string[] {
+  if (typeof localStorage === "undefined") return [];
+  try {
+    const parsed = JSON.parse(localStorage.getItem(FOLDER_KEY) ?? "[]") as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string").slice(0, 8);
+  } catch {
+    return [];
+  }
+}
+
+function rememberFolder(folder: string): string[] {
+  const next = [folder, ...readFolders().filter((item) => item !== folder)].slice(0, 8);
+  localStorage.setItem(FOLDER_KEY, JSON.stringify(next));
+  return next;
 }
 
 function joinPath(parent: string, name: string): string {

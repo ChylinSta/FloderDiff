@@ -1,5 +1,6 @@
 export { browseDirectory, platformRoots } from "./browse";
-export { assertSafeCopy, copyFileTo, copyPath, copyTree, resolveInsideRoot } from "./copy";
+export { assertSafeCopy, copyFileTo, copyPath, copyTree, previewCopy, resolveInsideRoot } from "./copy";
+export type { CopyOptions, CopyPlanSummary, CopyProgress, CopyResult } from "./copy";
 export { decodeSample, encodingLabel, sniffEncoding, sniffUtf16WithoutBom } from "./encoding";
 export { CompareError } from "./errors";
 export { fileExitCode, folderExitCode } from "./exit-code";

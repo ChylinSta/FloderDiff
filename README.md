@@ -59,10 +59,10 @@ npm run folderdiff -- files C:\compare\a.txt C:\compare\b.txt --json
 
 - Compare two folders recursively. Click a file to drill into it.
 - Compare two text files, with change, insert, and delete highlighting. Inside a changed word, only the changed characters are marked (`value1` versus `value2` highlights `1` and `2`).
-- See a binary file called out as binary when it contains a null byte or is not valid UTF-8. UTF-16 LE and UTF-16 BE are shown as text when a byte-order mark is present, or when the bytes are even-length and clearly look like ASCII stored as UTF-16. Other UTF-16, including text that is mostly not ASCII, stays binary.
-- Refresh, copy a path, copy a file or a selected folder from one side to the other, and open a path in the system default application (`xdg-open` on Linux, `start` on Windows, `open` on macOS). Copying a folder adds and overwrites files. It does not delete files that exist only on the destination, and it does not delete the source. Symlinks inside the folder are skipped.
-- Watch folder compare progress (walking, then hashing) and cancel it. The page stays usable while that runs.
-- Paste a path, pick a recent path, and see whether the path is a folder, a file, or missing before you compare.
+- See a binary file called out as binary when it contains a null byte or is not valid UTF-8. UTF-16 LE and UTF-16 BE are shown as text with a byte-order mark, or without one when the bytes are even-length and decode as text (ASCII or letters such as CJK) in one endianness. Short or mixed binary stays binary.
+- Refresh, copy a path, copy a file or a selected folder from one side to the other, and open a path in the system default application (`xdg-open` on Linux, `start` on Windows, `open` on macOS). Copying a folder adds and overwrites files and does not delete the source. By default it also leaves files that exist only on the destination. The confirm step can opt in to removing those destination-only items; that removal cannot be undone from FolderDiff. Symlinks are skipped unless you ask to recreate links whose targets stay inside the compare. Links that would escape, or whose target is missing, are skipped and never followed.
+- Watch folder compare progress and folder copy progress, and cancel either one. The page stays usable while that runs.
+- Type or paste a full path in Browse and press Go, pick a recent folder, or use a drive letter when the server is on Windows. Each path field also shows whether the path is a folder, a file, or missing.
 - Filter the folder tree by name.
 - Ignore names such as `node_modules` or `.git`, or globs such as `*.log`. Defaults are `node_modules`, `.git`, and `.DS_Store`. Clear the ignore field to compare everything. `*.log` is not ignored until you add it.
 - Load the sample trees under `fixtures/left` and `fixtures/right`, or the sample text pair under `fixtures/files/`.
@@ -92,15 +92,15 @@ Exit codes:
 
 ## Limits
 
-FolderDiff does not open the operating-system file dialog. **Browse** lists directories, and you can paste a path. A native picker would need a desktop shell, which this version does not include.
+There is no operating-system file dialog. Browse is an in-app directory listing: type or paste a path, use a recent folder, or pick a listed drive. A system picker would need a desktop shell, which this app does not include.
 
-The server is developed and checked on Linux. These Windows behaviors are implemented and untested on a Windows machine:
+This checkout is developed and tested on Linux. The following Windows behavior is implemented and has **not** been run on a Windows machine here:
 
 - **Open** launches `cmd.exe /c start "" <path>`.
 - **Browse** looks for drive letters `A:\` through `Z:\`.
-- Creating a symlink in the automated tests is skipped when the OS refuses the link.
+- Symlink tests skip themselves when the OS refuses to create a link.
 
-Do not expose port 43123 beyond localhost. The process can read files as the user running Node, and it can copy a file or folder after you confirm.
+Do not expose port 43123 beyond localhost. The process can read files as the user running Node. It copies or deletes only after the confirm step, and a mirror copy deletes destination-only files permanently.
 
 ## Tests
 
@@ -122,6 +122,7 @@ The design record for this version is in `.feature-dev/folder-diff-v1/`:
 - `human_diff.md`
 - `iterate-1.md`
 - `iterate-2.md`
+- `iterate-3.md`
 
 ## License
 
