@@ -37,16 +37,31 @@ npm start
 
 ## Run the app on Windows
 
-Install Node.js 20 or newer from [https://nodejs.org](https://nodejs.org), then in **Command Prompt** or **PowerShell**, from this folder:
+FolderDiff needs **Node.js 20 or newer** and npm. In **Command Prompt** or **PowerShell**, `node -v` should print `v20` or higher. If it does not, install Node.js from [https://nodejs.org](https://nodejs.org) and open a new terminal.
+
+Clone the repository, install dependencies, run the tests, and start the app:
 
 ```bat
+git clone https://github.com/ChylinSta/FloderDiff.git
+cd FloderDiff
 npm install
+npm test
 npm run dev
 ```
 
-Open http://127.0.0.1:43123 in a browser on the same PC.
+`npm test` runs the Vitest suite. `npm run dev` starts Next.js on **127.0.0.1** port **43123**. Open [http://127.0.0.1:43123](http://127.0.0.1:43123) in a browser on the same PC. Do not expose that port on a LAN.
 
-Paths can be pasted either as `C:\Users\me\left` or `C:/Users/me/left`. Use **Browse** to list drives and folders if you would rather not type them. **Open left** / **Open right** launches the Windows default app with `cmd.exe /c start "" <path>` (no shell-concatenated string).
+After `npm install`, you can start the same dev server with `start.cmd` (double-click it, or run `start.cmd` from this folder). The script switches to its own directory, prints `node -v`, runs `npm install` only when `node_modules` is missing, and then runs `npm run dev`. It does not replace `npm test`.
+
+Type or paste a full path into the left and right fields. Drive letters work with backslashes or forward slashes:
+
+- `C:\Users\me\compare\left`
+- `C:/Users/me/compare/left`
+- `D:\data`
+
+There is no operating-system file dialog. Browse is an in-app directory listing: type or paste a path, pick a recent folder, or choose a listed drive. A system picker would need a desktop shell, which this app does not include.
+
+This checkout is developed and tested on Linux. **Open** (`cmd.exe /c start "" <path>`) and drive-letter browse (`A:\` through `Z:\`) are implemented and have **not** been verified on a real Windows machine. `start.cmd` is a thin wrapper around the commands above and has not been executed on Windows either.
 
 The CLI uses the same path style:
 
@@ -98,6 +113,7 @@ This checkout is developed and tested on Linux. The following Windows behavior i
 
 - **Open** launches `cmd.exe /c start "" <path>`.
 - **Browse** looks for drive letters `A:\` through `Z:\`.
+- `start.cmd` only wraps `npm run dev` and has not been executed on Windows.
 - Symlink tests skip themselves when the OS refuses to create a link.
 
 Do not expose port 43123 beyond localhost. The process can read files as the user running Node. It copies or deletes only after the confirm step, and a mirror copy deletes destination-only files permanently.
