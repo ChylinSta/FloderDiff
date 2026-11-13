@@ -1,9 +1,9 @@
-import { lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { assertSafeCopy, copyFileTo, copyPath, previewCopy, resolveInsideRoot } from "./copy";
+import { assertSafeCopy, CopyCancelledError, copyFileTo, copyPath, previewCopy, resolveInsideRoot } from "./copy";
 import type { CopyProgress } from "./copy";
 import { CompareError } from "./errors";
 
@@ -12,15 +12,6 @@ const cleanup: string[] = [];
 afterEach(async () => {
   await Promise.all(cleanup.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
-
-async function readdirSafe(directory: string): Promise<string[]> {
-  try {
-    const { readdir } = await import("node:fs/promises");
-    return await readdir(directory);
-  } catch {
-    return [];
-  }
-}
 
 describe("copy between sides", () => {
   it("creates a missing destination and refuses to overwrite until asked", async () => {
@@ -135,9 +126,93 @@ describe("copy between sides", () => {
           if (progress.phase === "copy" && progress.done === 1) controller.abort();
         },
       }),
-    ).rejects.toThrow(/cancelled/i);
-    const copiedNames = await readdirSafe(again);
-    expect(copiedNames.length).toBeLessThan(3);
+    ).rejects.toBeInstanceOf(CopyCancelledError);
+    await expect(lstat(again)).rejects.toThrow();
+  });
+
+  it("rolls back files this copy wrote and leaves pre-existing files alone", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "folderdiff-tree-rollback-"));
+    cleanup.push(root);
+    const source = path.join(root, "left");
+    const destination = path.join(root, "right");
+    await mkdir(source);
+    await mkdir(destination);
+    await writeFile(path.join(source, "a.txt"), "new\n");
+    await writeFile(path.join(source, "b.txt"), "b\n");
+    await writeFile(path.join(destination, "a.txt"), "old\n");
+    await writeFile(path.join(destination, "keep.txt"), "keep\n");
+    const controller = new AbortController();
+    const error = await copyPath(source, destination, {
+      overwrite: true,
+      signal: controller.signal,
+      onProgress: (progress) => {
+        if (progress.phase === "copy" && progress.done === 1) controller.abort();
+      },
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(CopyCancelledError);
+    expect((error as CopyCancelledError).report.partial).toEqual([]);
+    expect((error as CopyCancelledError).message).toMatch(/left in place/);
+    expect(await readFile(path.join(destination, "a.txt"), "utf8")).toBe("old\n");
+    expect(await readFile(path.join(destination, "keep.txt"), "utf8")).toBe("keep\n");
+    await expect(readFile(path.join(destination, "b.txt"))).rejects.toThrow();
+  });
+
+  it("puts back a destination-only file when a mirror copy is cancelled", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "folderdiff-tree-rollback-mirror-"));
+    cleanup.push(root);
+    const source = path.join(root, "left");
+    const destination = path.join(root, "right");
+    await mkdir(source);
+    await mkdir(destination);
+    await writeFile(path.join(source, "a.txt"), "new\n");
+    await writeFile(path.join(destination, "a.txt"), "old\n");
+    await writeFile(path.join(destination, "extra.txt"), "extra\n");
+    const controller = new AbortController();
+    const error = await copyPath(source, destination, {
+      overwrite: true,
+      mirror: true,
+      signal: controller.signal,
+      onProgress: (progress) => {
+        if (progress.phase === "delete" && progress.done === 1) controller.abort();
+      },
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(CopyCancelledError);
+    expect((error as CopyCancelledError).report.partial).toEqual([]);
+    expect(await readFile(path.join(destination, "a.txt"), "utf8")).toBe("old\n");
+    expect(await readFile(path.join(destination, "extra.txt"), "utf8")).toBe("extra\n");
+  });
+
+  it("names paths it could not roll back", async () => {
+    if (process.platform === "win32") return;
+    const root = await mkdtemp(path.join(tmpdir(), "folderdiff-tree-partial-"));
+    cleanup.push(root);
+    const source = path.join(root, "left");
+    const destination = path.join(root, "right");
+    await mkdir(source);
+    await writeFile(path.join(source, "a.txt"), "a\n");
+    const controller = new AbortController();
+    let thrown: unknown;
+    try {
+      await copyPath(source, destination, {
+        overwrite: true,
+        signal: controller.signal,
+        onProgress: async (progress) => {
+          if (progress.phase === "copy" && progress.done === 1) {
+            await chmod(destination, 0o555);
+            controller.abort();
+          }
+        },
+      });
+    } catch (error) {
+      thrown = error;
+    } finally {
+      await chmod(destination, 0o755).catch(() => undefined);
+    }
+    expect(thrown).toBeInstanceOf(CopyCancelledError);
+    const error = thrown as CopyCancelledError;
+    expect(error.report.partial.length).toBeGreaterThan(0);
+    expect(error.message).toMatch(/Partial copy/);
+    expect(await readFile(path.join(destination, "a.txt"), "utf8")).toBe("a\n");
   });
 
   it("removes destination-only files only when mirror is requested", async () => {
@@ -227,5 +302,9 @@ describe("copy between sides", () => {
     await mkdir(path.join(root, "nested"));
     await expect(copyPath(root, path.join(root, "nested"), true)).rejects.toThrow(/into itself/);
     expect(() => assertSafeCopy(path.join(root, "nested"), path.parse(root).root)).toThrow(/drive root/);
+    expect(() => assertSafeCopy("C:\\data\\src", "C:\\")).toThrow(/drive root/);
+    expect(() => assertSafeCopy("D:\\data", "D:/data")).toThrow(/same path/);
+    expect(() => assertSafeCopy("D:\\data", "D:\\data\\child")).toThrow(/into itself/);
+    expect(resolveInsideRoot("C:/data", "nested/file.txt")).toBe("C:\\data\\nested\\file.txt");
   });
 });

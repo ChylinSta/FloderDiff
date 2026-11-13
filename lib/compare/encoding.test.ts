@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { decodeSample, sniffEncoding } from "./encoding";
+import { decodeSample, sniffEncoding, sniffUtf16WithoutBom } from "./encoding";
 import { diffFiles } from "./text-diff";
 
 const cleanup: string[] = [];
@@ -113,6 +113,23 @@ describe("encoding detection", () => {
     expect(result.identical).toBe(false);
     expect(result.encodingsDiffer).toBe(true);
     expect(result.hunks).toHaveLength(0);
+  });
+
+  it("decodes a short ASCII UTF-16 sample of at least two characters", () => {
+    const le = Buffer.from("hi", "utf16le");
+    const be = swapUtf16(le);
+    expect(le.length).toBe(4);
+    expect(sniffEncoding(le)).toBe("utf-16le");
+    expect(sniffEncoding(be)).toBe("utf-16be");
+    expect(decodeSample(le, "utf-16le")).toBe("hi");
+    expect(sniffEncoding(Buffer.from("hi!", "utf16le"))).toBe("utf-16le");
+    expect(sniffEncoding(Buffer.from("A", "utf16le"))).toBe("binary");
+  });
+
+  it("does not guess when both UTF-16 endiannesses look like text", () => {
+    const ambiguous = Buffer.from([0x80, 0x30, 0x80, 0x30, 0x80, 0x30, 0x80, 0x30]);
+    expect(sniffUtf16WithoutBom(ambiguous)).toBeNull();
+    expect(sniffEncoding(ambiguous)).toBe("binary");
   });
 
   it("keeps UTF-8 Chinese and odd-length binary as themselves", () => {

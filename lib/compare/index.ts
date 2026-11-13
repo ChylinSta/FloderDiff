@@ -1,6 +1,7 @@
 export { browseDirectory, platformRoots } from "./browse";
-export { assertSafeCopy, copyFileTo, copyPath, copyTree, previewCopy, resolveInsideRoot } from "./copy";
-export type { CopyOptions, CopyPlanSummary, CopyProgress, CopyResult } from "./copy";
+export { beginCopy, cancelCopy, isCopyId } from "./copy-session";
+export { assertSafeCopy, copyFileTo, copyPath, copyTree, previewCopy, resolveInsideRoot, CopyCancelledError } from "./copy";
+export type { CopyCancelReport, CopyOptions, CopyPlanSummary, CopyProgress, CopyResult } from "./copy";
 export { decodeSample, encodingLabel, sniffEncoding, sniffUtf16WithoutBom } from "./encoding";
 export { CompareError } from "./errors";
 export { fileExitCode, folderExitCode } from "./exit-code";
@@ -10,7 +11,8 @@ export type { CompareOptions } from "./folder";
 export { hashFile } from "./hash";
 export { compileIgnore, DEFAULT_IGNORE } from "./ignore";
 export { inlineSpans } from "./inline";
-export { openInSystem } from "./open";
+export { openInSystem, openerCommand } from "./open";
+export { isWindowsAbsolute, normalizeUserPath } from "./paths";
 export { diffFiles, splitLines } from "./text-diff";
 export type {
   BrowseResult,

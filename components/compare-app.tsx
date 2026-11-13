@@ -59,6 +59,7 @@ export function CompareApp() {
   const [recent, setRecent] = useState<string[]>([]);
   const [pendingCopy, setPendingCopy] = useState<PendingCopy | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const copyIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -86,7 +87,7 @@ export function CompareApp() {
 
   const selected = folder?.entries.find((entry) => entry.relativePath === selectedPath) ?? null;
 
-  async function runCompare(overrides?: { mode?: Mode; left?: string; right?: string; keepSelection?: boolean; keepCopyStatus?: boolean }): Promise<boolean> {
+  async function runCompare(overrides?: { mode?: Mode; left?: string; right?: string; keepSelection?: boolean }): Promise<boolean> {
     const nextMode = overrides?.mode ?? mode;
     const nextLeft = (overrides?.left ?? left).trim();
     const nextRight = (overrides?.right ?? right).trim();
@@ -98,7 +99,7 @@ export function CompareApp() {
     const controller = new AbortController();
     abortRef.current = controller;
     setLoading(true);
-    if (!overrides?.keepCopyStatus) setCopyProgress(null);
+    setCopyProgress(null);
     setProgress(null);
     setError(null);
     setNotice(null);
@@ -159,7 +160,12 @@ export function CompareApp() {
     }
   }
 
-  function cancelCompare() {
+  function cancelActive() {
+    const copyId = copyIdRef.current;
+    if (copyId) {
+      void requestCopyCancel(copyId);
+      return;
+    }
     abortRef.current?.abort();
   }
 
@@ -174,7 +180,7 @@ export function CompareApp() {
         overwrite: true,
         kind: "file",
         title: "Overwrite this file?",
-        label: `Replace ${to} with the other file? This overwrites that path.`,
+        label: `Replace ${to} with the other file? This overwrites that path. Canceling restores the previous file.`,
       });
       return;
     }
@@ -199,10 +205,10 @@ export function CompareApp() {
       kind: folderCopy ? "directory" : "file",
       title: folderCopy ? "Copy this folder?" : destinationExists ? "Overwrite this file?" : "Copy this file?",
       label: folderCopy
-        ? `Copy the folder ${selected.relativePath} to the ${side}? The source folder is not deleted.`
+        ? `Copy the folder ${selected.relativePath} to the ${side}? The source folder is not deleted. If you cancel, files this copy created are removed and files it overwrote are restored.`
         : destinationExists
-          ? `Replace ${selected.relativePath} on the ${side}? This overwrites that file. The source is not deleted.`
-          : `Copy ${selected.relativePath} to the ${side}? A new file will be created there.`,
+          ? `Replace ${selected.relativePath} on the ${side}? This overwrites that file. The source is not deleted. Canceling restores the previous file.`
+          : `Copy ${selected.relativePath} to the ${side}? A new file will be created there. Canceling removes that new file.`,
     });
   }
 
@@ -244,12 +250,15 @@ export function CompareApp() {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    const copyId = crypto.randomUUID();
+    copyIdRef.current = copyId;
     setLoading(true);
     setProgress(null);
     setCopyProgress({ phase: "copy", done: 0, total: 0, path: request.relativePath });
     try {
       const result = await streamCopy(
         {
+          copyId,
           from: request.from,
           to: request.to,
           toRoot: request.toRoot,
@@ -262,28 +271,30 @@ export function CompareApp() {
         },
         { signal: controller.signal, onProgress: setCopyProgress },
       );
-      if (controller.signal.aborted) return;
-      const copied = result.filesCopied ?? 0;
-      const removed = result.deleted ?? 0;
-      setCopyProgress({
-        phase: "copy",
-        done: copied,
-        total: Math.max(copied, 1),
-        path: removed > 0 ? `removed ${removed} destination-only` : request.relativePath,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 700));
-      const refreshed = await runCompare({ keepSelection: true, keepCopyStatus: true });
-      if (refreshed) setNotice(describeCopy(result));
-    } catch (caught) {
-      if (isAbort(caught) || controller.signal.aborted) {
+      if (controller.signal.aborted) {
         setCopyProgress(null);
-        await runCompare({ keepSelection: true, keepCopyStatus: true });
-        setNotice("Copy cancelled. Files already copied stay on the destination.");
         return;
       }
       setCopyProgress(null);
+      const refreshed = await runCompare({ keepSelection: true });
+      if (refreshed) setNotice(describeCopy(result));
+    } catch (caught) {
+      setCopyProgress(null);
+      if (isCancelledCopy(caught)) {
+        await runCompare({ keepSelection: true });
+        if (caught.partial.length > 0) setError(caught.message);
+        else setNotice(caught.message);
+        return;
+      }
+      if (isAbort(caught) || controller.signal.aborted) {
+        if (abortRef.current === controller) await runCompare({ keepSelection: true });
+        setNotice("Copy cancelled. New files from this copy were rolled back when that was safe. Pre-existing files this copy did not write were left in place.");
+        return;
+      }
       setLoading(false);
       setError(caught instanceof Error ? caught.message : "Could not copy that path.");
+    } finally {
+      if (copyIdRef.current === copyId) copyIdRef.current = null;
     }
   }
 
@@ -385,22 +396,22 @@ export function CompareApp() {
             Refresh
           </Button>
           {loading ? (
-            <Button type="button" variant="outline" onClick={cancelCompare}>
+            <Button type="button" variant="outline" onClick={cancelActive}>
               Cancel
             </Button>
           ) : null}
         </div>
       </header>
 
-      {copyProgress ? (
+      {copyProgress && !progress ? (
         <div className="sticky top-0 z-30 flex flex-wrap items-center gap-3 border-b bg-primary px-4 py-2 text-sm text-primary-foreground" role="status">
           <span>
             {copyProgress.phase === "delete" ? "Removing" : copyProgress.phase === "plan" ? "Planning copy" : "Copying"}
             {copyProgress.total > 0 ? ` ${copyProgress.done} / ${copyProgress.total}` : ""}
           </span>
           {copyProgress.path ? <span className="min-w-0 flex-1 truncate font-mono text-xs opacity-90">{copyProgress.path}</span> : null}
-          {loading && !progress ? (
-            <Button type="button" size="sm" variant="secondary" onClick={cancelCompare}>
+          {loading ? (
+            <Button type="button" size="sm" variant="secondary" onClick={cancelActive}>
               Cancel
             </Button>
           ) : null}
@@ -420,7 +431,7 @@ export function CompareApp() {
           </span>
           {progress.path ? <span className="min-w-0 flex-1 truncate font-mono text-xs opacity-90">{progress.path}</span> : null}
           {loading ? (
-            <Button type="button" size="sm" variant="secondary" onClick={cancelCompare}>
+            <Button type="button" size="sm" variant="secondary" onClick={cancelActive}>
               Cancel
             </Button>
           ) : null}
@@ -1026,8 +1037,16 @@ async function streamCopy(
     buffer = lines.pop() ?? "";
     for (const line of lines) {
       if (!line.trim()) continue;
-      const event = JSON.parse(line) as { type: string; error?: string; result?: CopyResponse } & CopyProgress;
+      const event = JSON.parse(line) as {
+        type: string;
+        error?: string;
+        result?: CopyResponse;
+        removed?: string[];
+        restored?: string[];
+        partial?: string[];
+      } & CopyProgress;
       if (event.type === "progress") latest = event;
+      else if (event.type === "cancelled") throw cancelledCopyError(event);
       else if (event.type === "error") throw new Error(event.error ?? "Copy failed.");
       else if (event.result) result = event.result;
     }
@@ -1045,6 +1064,44 @@ async function streamCopy(
 
 function isAbort(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
+}
+
+type CancelledCopy = Error & {
+  copyCancelled: true;
+  partial: string[];
+  removed: string[];
+  restored: string[];
+};
+
+function cancelledCopyError(event: { error?: string; removed?: string[]; restored?: string[]; partial?: string[] }): CancelledCopy {
+  const error = new Error(event.error ?? "Copy cancelled.") as CancelledCopy;
+  error.name = "CopyCancelledError";
+  error.copyCancelled = true;
+  error.partial = event.partial ?? [];
+  error.removed = event.removed ?? [];
+  error.restored = event.restored ?? [];
+  return error;
+}
+
+function isCancelledCopy(error: unknown): error is CancelledCopy {
+  return error instanceof Error && "copyCancelled" in error && (error as CancelledCopy).copyCancelled === true;
+}
+
+async function requestCopyCancel(copyId: string): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const response = await fetch("/api/copy/cancel", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ copyId }),
+      });
+      const body = (await response.json().catch(() => ({}))) as { cancelled?: boolean };
+      if (body.cancelled) return;
+    } catch {
+      // The copy request is still open. Try again briefly.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 40));
+  }
 }
 
 const RECENT_KEY = "folderdiff-recent-paths";

@@ -61,7 +61,7 @@ Type or paste a full path into the left and right fields. Drive letters work wit
 
 There is no operating-system file dialog. Browse is an in-app directory listing: type or paste a path, pick a recent folder, or choose a listed drive. A system picker would need a desktop shell, which this app does not include.
 
-This checkout is developed and tested on Linux. **Open** (`cmd.exe /c start "" <path>`) and drive-letter browse (`A:\` through `Z:\`) are implemented and have **not** been verified on a real Windows machine. `start.cmd` is a thin wrapper around the commands above and has not been executed on Windows either.
+This checkout is developed and tested on Linux. Pasted paths such as `C:\Users\me\compare\left`, `C:/Users/me/compare/left`, and `D:\data` are normalized with Windows path rules in unit tests. **Open** (`cmd.exe /c start "" <path>`), drive-letter browse (`A:\` through `Z:\`), and `start.cmd` are implemented and have **not** been executed on a real Windows machine. The `start` command is covered by a mock that checks the arguments, not by launching `cmd.exe`.
 
 The CLI uses the same path style:
 
@@ -74,9 +74,9 @@ npm run folderdiff -- files C:\compare\a.txt C:\compare\b.txt --json
 
 - Compare two folders recursively. Click a file to drill into it.
 - Compare two text files, with change, insert, and delete highlighting. Inside a changed word, only the changed characters are marked (`value1` versus `value2` highlights `1` and `2`).
-- See a binary file called out as binary when it contains a null byte or is not valid UTF-8. UTF-16 LE and UTF-16 BE are shown as text with a byte-order mark, or without one when the bytes are even-length and decode as text (ASCII or letters such as CJK) in one endianness. Short or mixed binary stays binary.
+- See a binary file called out as binary when it contains a null byte or is not valid UTF-8. UTF-16 LE and UTF-16 BE are shown as text with a byte-order mark, or without one when one endianness decodes cleanly as text. A no-BOM sample of four or six bytes is text only when every pair is ASCII in exactly one endianness. A two-byte sample, mixed binary, and a sample whose two endiannesses look equally like text stay binary.
 - Refresh, copy a path, copy a file or a selected folder from one side to the other, and open a path in the system default application (`xdg-open` on Linux, `start` on Windows, `open` on macOS). Copying a folder adds and overwrites files and does not delete the source. By default it also leaves files that exist only on the destination. The confirm step can opt in to removing those destination-only items; that removal cannot be undone from FolderDiff. Symlinks are skipped unless you ask to recreate links whose targets stay inside the compare. Links that would escape, or whose target is missing, are skipped and never followed.
-- Watch folder compare progress and folder copy progress, and cancel either one. The page stays usable while that runs.
+- Watch folder compare progress and folder copy progress, and cancel either one. The page stays usable while that runs. Canceling a copy removes files that copy created and restores files it overwrote or removed, when rollback succeeds. Files that were already on the destination, and that this copy did not write, stay. If rollback cannot finish, FolderDiff names the paths it left behind. The copying line clears when the copy ends, before the compare that follows.
 - Type or paste a full path in Browse and press Go, pick a recent folder, or use a drive letter when the server is on Windows. Each path field also shows whether the path is a folder, a file, or missing.
 - Filter the folder tree by name.
 - Ignore names such as `node_modules` or `.git`, or globs such as `*.log`. Defaults are `node_modules`, `.git`, and `.DS_Store`. Clear the ignore field to compare everything. `*.log` is not ignored until you add it.
@@ -111,9 +111,9 @@ There is no operating-system file dialog. Browse is an in-app directory listing:
 
 This checkout is developed and tested on Linux. The following Windows behavior is implemented and has **not** been run on a Windows machine here:
 
-- **Open** launches `cmd.exe /c start "" <path>`.
-- **Browse** looks for drive letters `A:\` through `Z:\`.
-- `start.cmd` only wraps `npm run dev` and has not been executed on Windows.
+- **Open** launches `cmd.exe /c start "" <path>`. A unit test checks those arguments with a mock. It has not been run on Windows.
+- **Browse** looks for drive letters `A:\` through `Z:\`. That listing has not been run on Windows.
+- `start.cmd` checks that Node.js is on PATH and is version 20 or newer, then runs `npm run dev`. It has not been executed on Windows.
 - Symlink tests skip themselves when the OS refuses to create a link.
 
 Do not expose port 43123 beyond localhost. The process can read files as the user running Node. It copies or deletes only after the confirm step, and a mirror copy deletes destination-only files permanently.
@@ -139,6 +139,7 @@ The design record for this version is in `.feature-dev/folder-diff-v1/`:
 - `iterate-1.md`
 - `iterate-2.md`
 - `iterate-3.md`
+- `iterate-4.md`
 
 ## License
 

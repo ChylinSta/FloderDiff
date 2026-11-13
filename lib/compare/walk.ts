@@ -2,6 +2,7 @@ import { lstat, readdir, readlink } from "node:fs/promises";
 import path from "node:path";
 
 import { CompareError } from "./errors";
+import { normalizeUserPath } from "./paths";
 import type { IgnoreRules } from "./ignore";
 import type { WalkEntry, WalkResult } from "./types";
 
@@ -19,7 +20,7 @@ async function assertKind(input: string, expected: "directory" | "file"): Promis
       expected === "directory" ? "Choose a folder path." : "Choose a file path.",
     );
   }
-  const resolved = path.resolve(input);
+  const resolved = normalizeUserPath(input);
   let stat;
   try {
     stat = await lstat(resolved);

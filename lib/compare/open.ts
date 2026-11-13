@@ -1,14 +1,23 @@
 import { spawn } from "node:child_process";
 import { lstat } from "node:fs/promises";
-import path from "node:path";
 
 import { CompareError } from "./errors";
+import { normalizeUserPath } from "./paths";
 
-export async function openInSystem(input: string): Promise<void> {
+export function openerCommand(
+  target: string,
+  platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[] } {
+  if (platform === "win32") return { command: "cmd.exe", args: ["/c", "start", "", target] };
+  if (platform === "darwin") return { command: "open", args: [target] };
+  return { command: "xdg-open", args: [target] };
+}
+
+export async function openInSystem(input: string, platform: NodeJS.Platform = process.platform): Promise<void> {
   if (typeof input !== "string" || input.trim() === "") {
     throw new CompareError("Choose a path to open.");
   }
-  const resolved = path.resolve(input);
+  const resolved = normalizeUserPath(input);
   try {
     await lstat(resolved);
   } catch {
@@ -16,7 +25,7 @@ export async function openInSystem(input: string): Promise<void> {
   }
 
   await new Promise<void>((resolve, reject) => {
-    const child = spawnOpener(resolved);
+    const child = spawnOpener(resolved, platform);
     child.on("error", () => {
       reject(new CompareError("Could not launch the system opener.", 500));
     });
@@ -27,16 +36,11 @@ export async function openInSystem(input: string): Promise<void> {
   });
 }
 
-function spawnOpener(target: string) {
-  if (process.platform === "win32") {
-    return spawn("cmd.exe", ["/c", "start", "", target], {
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true,
-    });
-  }
-  if (process.platform === "darwin") {
-    return spawn("open", [target], { detached: true, stdio: "ignore" });
-  }
-  return spawn("xdg-open", [target], { detached: true, stdio: "ignore" });
+function spawnOpener(target: string, platform: NodeJS.Platform) {
+  const { command, args } = openerCommand(target, platform);
+  return spawn(command, args, {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: platform === "win32",
+  });
 }

@@ -1,6 +1,6 @@
 import { lstat } from "node:fs/promises";
-import path from "node:path";
 
+import { normalizeUserPath } from "@/lib/compare/paths";
 import type { PathDescription, PathKind } from "@/lib/compare/types";
 
 export async function GET(request: Request) {
@@ -8,7 +8,7 @@ export async function GET(request: Request) {
   if (raw.trim() === "") {
     return Response.json({ error: "Provide a path." }, { status: 400 });
   }
-  const resolved = path.resolve(raw);
+  const resolved = normalizeUserPath(raw);
   let description: PathDescription;
   try {
     const info = await lstat(resolved);

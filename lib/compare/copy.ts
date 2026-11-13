@@ -1,7 +1,10 @@
-import { copyFile, lstat, mkdir, readdir, rmdir, symlink, unlink, readlink } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { copyFile, lstat, mkdir, readdir, readlink, rename, rmdir, symlink, unlink } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import { CompareError } from "./errors";
+import { isFilesystemRoot, isStrictlyInside, isWindowsAbsolute, normalizeUserPath } from "./paths";
 
 export type CopyProgress = {
   phase: "plan" | "copy" | "delete";
@@ -47,6 +50,48 @@ export type CopyResult = {
   symlinksCopied: number;
   deleted: number;
 };
+
+export type CopyCancelReport = {
+  /** Paths this copy created, then removed. */
+  removed: string[];
+  /** Paths this copy overwrote or removed, then put back. */
+  restored: string[];
+  /** Paths that could not be undone. They are a partial copy. */
+  partial: string[];
+};
+
+export class CopyCancelledError extends CompareError {
+  readonly report: CopyCancelReport;
+
+  constructor(report: CopyCancelReport) {
+    super(formatCopyCancelled(report), 499);
+    this.name = "CopyCancelledError";
+    this.report = report;
+  }
+}
+
+export function formatCopyCancelled(report: CopyCancelReport): string {
+  const removed = report.removed.filter(Boolean);
+  const restored = report.restored.filter(Boolean);
+  const partial = report.partial.filter(Boolean);
+  if (partial.length > 0) {
+    const shown = partial.slice(0, 8).join(", ");
+    const extra = partial.length > 8 ? ` and ${partial.length - 8} more` : "";
+    return `Partial copy: cancelled, but these paths could not be rolled back: ${shown}${extra}. Other paths written by this copy were removed or restored. Pre-existing files this copy did not write were left in place.`;
+  }
+  if (removed.length === 0 && restored.length === 0) {
+    return "Copy cancelled. Nothing from this copy was left on the destination.";
+  }
+  const parts = ["Copy cancelled."];
+  if (removed.length > 0) {
+    parts.push(`Removed ${removed.length} path${removed.length === 1 ? "" : "s"} this copy had created.`);
+  }
+  if (restored.length > 0) {
+    parts.push(`Restored ${restored.length} path${restored.length === 1 ? "" : "s"} this copy had overwritten or removed.`);
+  }
+  parts.push("Pre-existing files this copy did not write were left in place.");
+  return parts.join(" ");
+}
 
 type PlannedFile = { from: string; to: string; relativePath: string; exists: boolean };
 type PlannedLink = { to: string; relativePath: string; target: string; exists: boolean };
@@ -113,18 +158,26 @@ export async function copyPath(
   }
   if (source.isDirectory()) return writeTree(from, to, options);
   if (source.isFile()) {
-    await options.onProgress?.({ phase: "copy", done: 0, total: 1, path: path.basename(from) });
-    throwIfAborted(options.signal);
-    const file = await copyFileTo(from, to, options.overwrite ?? false);
-    await options.onProgress?.({ phase: "copy", done: 1, total: 1, path: path.basename(from) });
-    return {
-      ...file,
-      filesCopied: 1,
-      skippedSymlinks: 0,
-      skippedSpecial: 0,
-      symlinksCopied: 0,
-      deleted: 0,
-    };
+    const journal = new CopyJournal();
+    try {
+      await options.onProgress?.({ phase: "copy", done: 0, total: 1, path: path.basename(from) });
+      throwIfAborted(options.signal);
+      const overwritten = await writeRegularFile(from, to, options.overwrite ?? false, journal, path.basename(from));
+      await options.onProgress?.({ phase: "copy", done: 1, total: 1, path: path.basename(from) });
+      throwIfAborted(options.signal);
+      await journal.commit();
+      return {
+        to,
+        overwritten,
+        filesCopied: 1,
+        skippedSymlinks: 0,
+        skippedSpecial: 0,
+        symlinksCopied: 0,
+        deleted: 0,
+      };
+    } catch (error) {
+      throw await finishCopyError(error, options.signal, journal);
+    }
   }
   throw new CompareError("That path is not a file or folder.", 400);
 }
@@ -146,9 +199,7 @@ export async function copyFileTo(
   if (source.isSymbolicLink() || !source.isFile()) {
     throw new CompareError("Only regular files can be copied.", 400);
   }
-  const overwritten = await prepareFileDestination(to, overwrite);
-  await mkdir(path.dirname(to), { recursive: true });
-  await copyFile(from, to);
+  const overwritten = await writeRegularFile(from, to, overwrite);
   return { to, overwritten };
 }
 
@@ -162,64 +213,67 @@ export async function copyTree(
 
 async function writeTree(from: string, to: string, options: CopyOptions): Promise<CopyResult> {
   assertSafeCopy(from, to);
-  await ensureDestinationDirectory(to);
-  await options.onProgress?.({ phase: "plan", done: 0, total: 0, path: path.basename(from) });
-  const plan = await buildTreePlan(from, to, options);
-  const overwritten = plan.files.some((item) => item.exists) || plan.links.some((item) => item.exists);
-  if (overwritten && !options.overwrite) {
-    throw new CompareError("The destination already contains files from this folder.", 409);
-  }
-  const copyTotal = plan.files.length + plan.links.length;
-  let done = 0;
-  for (const directory of plan.directories) {
+  const journal = new CopyJournal();
+  try {
+    await ensureDestinationDirectory(to);
+    await options.onProgress?.({ phase: "plan", done: 0, total: 0, path: path.basename(from) });
     throwIfAborted(options.signal);
-    await mkdir(directory, { recursive: true });
-  }
-  for (const item of plan.files) {
+    const plan = await buildTreePlan(from, to, options);
     throwIfAborted(options.signal);
-    await options.onProgress?.({ phase: "copy", done, total: copyTotal, path: item.relativePath });
-    await mkdir(path.dirname(item.to), { recursive: true });
-    if (item.exists) {
-      const existing = await lstat(item.to);
-      if (existing.isSymbolicLink()) await unlink(item.to);
+    const overwritten = plan.files.some((item) => item.exists) || plan.links.some((item) => item.exists);
+    if (overwritten && !options.overwrite) {
+      throw new CompareError("The destination already contains files from this folder.", 409);
     }
-    await copyFile(item.from, item.to);
-    done += 1;
-    await options.onProgress?.({ phase: "copy", done, total: copyTotal, path: item.relativePath });
-  }
-  for (const link of plan.links) {
-    throwIfAborted(options.signal);
-    await options.onProgress?.({ phase: "copy", done, total: copyTotal, path: link.relativePath });
-    await mkdir(path.dirname(link.to), { recursive: true });
-    if (link.exists) {
-      const existing = await lstat(link.to);
-      if (existing.isSymbolicLink() || existing.isFile()) await unlink(link.to);
-      else throw new CompareError(`A folder is in the way of ${link.to}.`, 400);
-    }
-    await symlink(link.target, link.to);
-    done += 1;
-    await options.onProgress?.({ phase: "copy", done, total: copyTotal, path: link.relativePath });
-  }
-  let deleted = 0;
-  if (options.mirror) {
-    const deleteTotal = plan.deletions.length;
-    for (const [index, item] of plan.deletions.entries()) {
+    const copyTotal = plan.files.length + plan.links.length;
+    let done = 0;
+    for (const directory of plan.directories) {
       throwIfAborted(options.signal);
-      await options.onProgress?.({ phase: "delete", done: index, total: deleteTotal, path: item.relativePath });
-      await removePlanned(to, item);
-      deleted += 1;
-      await options.onProgress?.({ phase: "delete", done: index + 1, total: deleteTotal, path: item.relativePath });
+      await createDirectory(directory, to, journal);
     }
+    for (const item of plan.files) {
+      throwIfAborted(options.signal);
+      await options.onProgress?.({ phase: "copy", done, total: copyTotal, path: item.relativePath });
+      throwIfAborted(options.signal);
+      await writeRegularFile(item.from, item.to, true, journal, item.relativePath);
+      done += 1;
+      await options.onProgress?.({ phase: "copy", done, total: copyTotal, path: item.relativePath });
+      throwIfAborted(options.signal);
+    }
+    for (const link of plan.links) {
+      throwIfAborted(options.signal);
+      await options.onProgress?.({ phase: "copy", done, total: copyTotal, path: link.relativePath });
+      throwIfAborted(options.signal);
+      await writeLink(link, journal);
+      done += 1;
+      await options.onProgress?.({ phase: "copy", done, total: copyTotal, path: link.relativePath });
+      throwIfAborted(options.signal);
+    }
+    let deleted = 0;
+    if (options.mirror) {
+      const deleteTotal = plan.deletions.length;
+      for (const [index, item] of plan.deletions.entries()) {
+        throwIfAborted(options.signal);
+        await options.onProgress?.({ phase: "delete", done: index, total: deleteTotal, path: item.relativePath });
+        throwIfAborted(options.signal);
+        await removePlanned(to, item, journal);
+        deleted += 1;
+        await options.onProgress?.({ phase: "delete", done: index + 1, total: deleteTotal, path: item.relativePath });
+        throwIfAborted(options.signal);
+      }
+    }
+    await journal.commit();
+    return {
+      to,
+      overwritten,
+      filesCopied: plan.files.length,
+      skippedSymlinks: plan.skippedLinks.length,
+      skippedSpecial: plan.skippedSpecial,
+      symlinksCopied: plan.links.length,
+      deleted,
+    };
+  } catch (error) {
+    throw await finishCopyError(error, options.signal, journal);
   }
-  return {
-    to,
-    overwritten,
-    filesCopied: plan.files.length,
-    skippedSymlinks: plan.skippedLinks.length,
-    skippedSpecial: plan.skippedSpecial,
-    symlinksCopied: plan.links.length,
-    deleted,
-  };
 }
 
 type TreePlan = {
@@ -242,8 +296,8 @@ async function buildTreePlan(from: string, to: string, options: CopyOptions): Pr
     sourcePaths: new Set([""]),
     deletions: [],
   };
-  const sourceRoot = path.resolve(options.sourceRoot ?? from);
-  const destRoot = path.resolve(options.destRoot ?? to);
+  const sourceRoot = normalizeUserPath(options.sourceRoot ?? from);
+  const destRoot = normalizeUserPath(options.destRoot ?? to);
   await walkSource(from, to, "", plan, options, sourceRoot, destRoot);
   if (options.mirror) await collectDeletions(to, "", plan);
   plan.deletions.sort((left, right) => right.relativePath.length - left.relativePath.length);
@@ -261,6 +315,7 @@ async function walkSource(
 ): Promise<void> {
   const dirents = await readdir(fromDir, { withFileTypes: true });
   for (const dirent of dirents) {
+    throwIfAborted(options.signal);
     const relativePath = relativeDir ? `${relativeDir}/${dirent.name}` : dirent.name;
     const source = path.join(fromDir, dirent.name);
     const destination = path.join(toDir, dirent.name);
@@ -319,7 +374,7 @@ async function classifyLink(
   } catch {
     return { action: "skip", reason: "could not read the link" };
   }
-  const sourceResolved = path.resolve(path.dirname(sourceLink), target);
+  const sourceResolved = resolveAgainst(sourceLink, target);
   if (!isContained(sourceRoot, sourceResolved)) {
     return { action: "skip", reason: "target leaves the compare root" };
   }
@@ -328,7 +383,7 @@ async function classifyLink(
   } catch {
     return { action: "skip", reason: "target is missing" };
   }
-  const destResolved = path.resolve(path.dirname(destinationLink), target);
+  const destResolved = resolveAgainst(destinationLink, target);
   if (!isContained(destRoot, destResolved)) {
     return { action: "skip", reason: "recreated link would leave the destination compare root" };
   }
@@ -365,7 +420,7 @@ async function collectDeletions(destDir: string, relativeDir: string, plan: Tree
   }
 }
 
-async function removePlanned(destinationRoot: string, item: PlannedDelete): Promise<void> {
+async function removePlanned(destinationRoot: string, item: PlannedDelete, journal: CopyJournal): Promise<void> {
   if (!isContained(destinationRoot, item.absolute)) {
     throw new CompareError("Refusing to delete a path outside the destination folder.", 400);
   }
@@ -377,14 +432,18 @@ async function removePlanned(destinationRoot: string, item: PlannedDelete): Prom
     throw error;
   }
   if (info.isSymbolicLink()) {
+    const target = await readlink(item.absolute);
     await unlink(item.absolute);
+    journal.add({ op: "restore-link", path: item.absolute, target, relativePath: item.relativePath });
     return;
   }
   if (info.isDirectory()) {
     await rmdir(item.absolute);
+    journal.add({ op: "removed-dir", path: item.absolute, relativePath: item.relativePath });
     return;
   }
-  await unlink(item.absolute);
+  const backup = await stageAside(item.absolute);
+  journal.add({ op: "staged", path: item.absolute, backup, relativePath: item.relativePath });
 }
 
 function summarize(plan: TreePlan): CopyPlanSummary {
@@ -439,22 +498,23 @@ export function resolveInsideRoot(rootInput: string, relativePath: string): stri
   if (parts.length === 0 || parts.some((part) => part === "." || part === "..")) {
     throw new CompareError("That path leaves the folder you are comparing.");
   }
-  const root = path.resolve(rootInput);
-  const target = path.resolve(root, ...parts);
-  const relative = path.relative(root, target);
-  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+  const root = normalizeUserPath(rootInput);
+  const api = isWindowsAbsolute(root) ? path.win32 : path;
+  const target = api.resolve(root, ...parts);
+  const relative = api.relative(root, target);
+  if (relative === "" || relative.startsWith("..") || api.isAbsolute(relative)) {
     throw new CompareError("That path leaves the folder you are comparing.");
   }
   return target;
 }
 
 export function assertSafeCopy(fromInput: string, toInput: string): void {
-  const source = path.resolve(fromInput);
-  const destination = path.resolve(toInput);
+  const source = normalizeUserPath(fromInput);
+  const destination = normalizeUserPath(toInput);
   if (isFilesystemRoot(source)) throw new CompareError("Refusing to copy a drive root.");
   if (isFilesystemRoot(destination)) throw new CompareError("Refusing to copy onto a drive root.");
   if (source === destination) throw new CompareError("Source and destination are the same path.");
-  if (isInside(source, destination) || isInside(destination, source)) {
+  if (isStrictlyInside(source, destination) || isStrictlyInside(destination, source)) {
     throw new CompareError("Refusing to copy a folder into itself.");
   }
 }
@@ -463,22 +523,75 @@ function resolveCopyInput(input: string): string {
   if (typeof input !== "string" || input.trim() === "") {
     throw new CompareError("Choose a source file and a destination.");
   }
-  return path.resolve(input);
+  return normalizeUserPath(input);
 }
 
-async function prepareFileDestination(to: string, overwrite: boolean): Promise<boolean> {
-  let dest;
-  try {
-    dest = await lstat(to);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return false;
-    throw new CompareError(error instanceof Error ? error.message : "Could not inspect the destination.", 400);
+async function writeRegularFile(
+  from: string,
+  to: string,
+  overwrite: boolean,
+  journal?: CopyJournal,
+  relativePath?: string,
+): Promise<boolean> {
+  const source = await lstat(from);
+  if (source.isSymbolicLink() || !source.isFile()) {
+    throw new CompareError("Only regular files can be copied.", 400);
   }
-  if (dest.isDirectory()) throw new CompareError("The destination is a directory.", 400);
-  if (!overwrite) throw new CompareError("The destination already exists.", 409);
-  if (dest.isSymbolicLink()) await unlink(to);
-  return true;
+  const kind = await destinationKind(to);
+  if (kind === "directory") throw new CompareError("The destination is a directory.", 400);
+  if (kind !== "missing" && !overwrite) throw new CompareError("The destination already exists.", 409);
+  const label = relativePath && relativePath.length > 0 ? relativePath : path.basename(to);
+  await ensureParentDirectories(to, journal);
+  if (kind === "symlink") {
+    const target = await readlink(to);
+    journal?.add({ op: "restore-link", path: to, target, relativePath: label });
+    await unlink(to);
+  } else if (kind === "file" && journal) {
+    const backup = tempBackupPath();
+    await copyFile(to, backup);
+    journal.add({ op: "backup-file", path: to, backup, relativePath: label });
+  } else if (kind === "other" && journal) {
+    journal.add({ op: "unrestorable", path: to, relativePath: label });
+  } else if (kind === "missing" && journal) {
+    journal.add({ op: "created-file", path: to, relativePath: label });
+  }
+  await copyFile(from, to);
+  return kind !== "missing";
+}
+
+async function writeLink(link: PlannedLink, journal: CopyJournal): Promise<void> {
+  await ensureParentDirectories(link.to, journal);
+  if (link.exists) {
+    const existing = await lstat(link.to);
+    if (existing.isSymbolicLink()) {
+      const previous = await readlink(link.to);
+      journal.add({ op: "restore-link", path: link.to, target: previous, relativePath: link.relativePath });
+      await unlink(link.to);
+    } else if (existing.isFile()) {
+      const backup = tempBackupPath();
+      await copyFile(link.to, backup);
+      journal.add({ op: "backup-file", path: link.to, backup, relativePath: link.relativePath });
+      await unlink(link.to);
+    } else {
+      throw new CompareError(`A folder is in the way of ${link.to}.`, 400);
+    }
+  } else {
+    journal.add({ op: "created-link", path: link.to, relativePath: link.relativePath });
+  }
+  await symlink(link.target, link.to);
+}
+
+async function createDirectory(directory: string, destinationRoot: string, journal: CopyJournal): Promise<void> {
+  const existed = await destinationKind(directory);
+  if (existed === "symlink") throw new CompareError("Refusing to copy onto a symlink.", 400);
+  if (existed !== "missing" && existed !== "directory") {
+    throw new CompareError("The destination is a file, not a folder.", 400);
+  }
+  if (existed === "directory") return;
+  await ensureParentDirectories(directory, journal);
+  await mkdir(directory);
+  const relativePath = directory === destinationRoot ? path.basename(directory) : relativeToRoot(destinationRoot, directory);
+  journal.add({ op: "created-dir", path: directory, relativePath });
 }
 
 function normalizeOptions(overwriteOrOptions: boolean | CopyOptions): CopyOptions {
@@ -490,16 +603,178 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new CompareError("Copy cancelled.", 499);
 }
 
-function isInside(parent: string, child: string): boolean {
-  const relative = path.relative(parent, child);
-  return relative !== "" && !relative.startsWith("..") && !path.isAbsolute(relative);
-}
-
 function isContained(root: string, target: string): boolean {
-  const relative = path.relative(path.resolve(root), path.resolve(target));
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  const api = isWindowsAbsolute(root) ? path.win32 : path;
+  const relative = api.relative(api.resolve(root), api.resolve(target));
+  return relative === "" || (!relative.startsWith("..") && !api.isAbsolute(relative));
 }
 
-function isFilesystemRoot(target: string): boolean {
-  return path.resolve(target) === path.parse(target).root;
+function resolveAgainst(linkPath: string, target: string): string {
+  const api = isWindowsAbsolute(linkPath) ? path.win32 : path;
+  return api.resolve(api.dirname(linkPath), target);
+}
+
+function relativeToRoot(root: string, target: string): string {
+  const api = isWindowsAbsolute(root) ? path.win32 : path;
+  const relative = api.relative(root, target);
+  if (!relative || relative.startsWith("..") || api.isAbsolute(relative)) return api.basename(target);
+  return relative.split(api.sep).join("/");
+}
+
+async function ensureParentDirectories(target: string, journal?: CopyJournal): Promise<void> {
+  const parent = path.dirname(target);
+  if (parent === target) return;
+  const kind = await destinationKind(parent);
+  if (kind === "directory") return;
+  if (kind !== "missing") throw new CompareError("The destination is not a folder.", 400);
+  await ensureParentDirectories(parent, journal);
+  await mkdir(parent);
+  journal?.add({ op: "created-dir", path: parent, relativePath: path.basename(parent) });
+}
+
+function tempBackupPath(): string {
+  return path.join(os.tmpdir(), `folderdiff-rollback-${randomBytes(8).toString("hex")}`);
+}
+
+async function stageAside(target: string): Promise<string> {
+  const backup = tempBackupPath();
+  try {
+    await rename(target, backup);
+    return backup;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+  }
+  await copyFile(target, backup);
+  await unlink(target);
+  return backup;
+}
+
+async function finishCopyError(error: unknown, signal: AbortSignal | undefined, journal: CopyJournal): Promise<unknown> {
+  const cancelled = Boolean(signal?.aborted) || (error instanceof CompareError && error.status === 499);
+  const report = await journal.rollback();
+  if (cancelled) return new CopyCancelledError(report);
+  if (report.partial.length > 0 && error instanceof Error) {
+    error.message = `${error.message} Partial copy left behind: ${report.partial.join(", ")}.`;
+  }
+  return error;
+}
+
+type JournalEntry =
+  | { op: "created-dir"; path: string; relativePath: string }
+  | { op: "created-file"; path: string; relativePath: string }
+  | { op: "created-link"; path: string; relativePath: string }
+  | { op: "backup-file"; path: string; backup: string; relativePath: string }
+  | { op: "restore-link"; path: string; target: string; relativePath: string }
+  | { op: "staged"; path: string; backup: string; relativePath: string }
+  | { op: "removed-dir"; path: string; relativePath: string }
+  | { op: "unrestorable"; path: string; relativePath: string };
+
+class CopyJournal {
+  private entries: JournalEntry[] = [];
+
+  add(entry: JournalEntry): void {
+    this.entries.push(entry);
+  }
+
+  async commit(): Promise<void> {
+    for (const entry of this.entries) {
+      if ((entry.op === "backup-file" || entry.op === "staged") && entry.backup) {
+        await unlink(entry.backup).catch(() => undefined);
+      }
+    }
+    this.entries = [];
+  }
+
+  async rollback(): Promise<CopyCancelReport> {
+    const removed: string[] = [];
+    const restored: string[] = [];
+    const partial: string[] = [];
+    for (const entry of [...this.entries].reverse()) {
+      try {
+        await undoJournalEntry(entry);
+        if (entry.op === "created-dir" || entry.op === "created-file" || entry.op === "created-link") {
+          removed.push(entry.relativePath);
+        } else if (entry.op !== "unrestorable") {
+          restored.push(entry.relativePath);
+        }
+      } catch {
+        partial.push(entry.relativePath);
+      }
+    }
+    this.entries = [];
+    return { removed, restored, partial };
+  }
+}
+
+async function undoJournalEntry(entry: JournalEntry): Promise<void> {
+  if (entry.op === "unrestorable") throw new Error("unsafe");
+  if (entry.op === "created-file" || entry.op === "created-link") {
+    await unlinkIfExists(entry.path);
+    return;
+  }
+  if (entry.op === "created-dir") {
+    try {
+      await rmdir(entry.path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    return;
+  }
+  if (entry.op === "removed-dir") {
+    await mkdir(entry.path);
+    return;
+  }
+  if (entry.op === "restore-link") {
+    await unlinkIfExists(entry.path);
+    await symlink(entry.target, entry.path);
+    return;
+  }
+  if (entry.op === "backup-file") {
+    await restoreBackupFile(entry.backup, entry.path);
+    return;
+  }
+  await restoreStaged(entry.backup, entry.path);
+}
+
+async function restoreBackupFile(backup: string, target: string): Promise<void> {
+  const holding = `${target}.folderdiff-restore-${randomBytes(4).toString("hex")}`;
+  await copyFile(backup, holding);
+  await unlinkIfExists(target);
+  try {
+    await rename(holding, target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+    await copyFile(holding, target);
+    await unlink(holding);
+  }
+  await unlink(backup).catch(() => undefined);
+}
+
+async function restoreStaged(backup: string, target: string): Promise<void> {
+  await mkdir(path.dirname(target), { recursive: true });
+  const info = await lstat(backup);
+  if (info.isSymbolicLink()) {
+    const linkTarget = await readlink(backup);
+    await unlinkIfExists(target);
+    await symlink(linkTarget, target);
+    await unlink(backup);
+    return;
+  }
+  if ((await destinationKind(target)) !== "missing") throw new Error("path occupied");
+  try {
+    await rename(backup, target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+    await copyFile(backup, target);
+    await unlink(backup);
+  }
+}
+
+async function unlinkIfExists(target: string): Promise<void> {
+  try {
+    await unlink(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }

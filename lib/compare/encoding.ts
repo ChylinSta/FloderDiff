@@ -28,9 +28,13 @@ export function sniffEncoding(sample: Buffer): SampleEncoding {
  * UTF-16 LE/BE with no BOM.
  * Accepts ASCII-heavy text (NUL in the other byte) and other letters, including CJK,
  * when one endianness decodes cleanly and the other does not.
+ * Four or six bytes are accepted only when every pair is ASCII in exactly one endianness.
+ * Two bytes stay undecided: one code unit is too easy to confuse with binary.
+ * When both endiannesses look equally like text, this returns null instead of guessing.
  */
 export function sniffUtf16WithoutBom(sample: Buffer): "utf-16le" | "utf-16be" | null {
-  if (sample.length < 8 || sample.length % 2 !== 0) return null;
+  if (sample.length < 2 || sample.length % 2 !== 0) return null;
+  if (sample.length < 8) return sniffShortAsciiUtf16(sample);
   const le = scoreUtf16(sample, "utf-16le");
   const be = scoreUtf16(sample, "utf-16be");
   const leOk = le !== null && le.ratio >= 0.75 && le.good >= 4;
@@ -45,6 +49,32 @@ export function sniffUtf16WithoutBom(sample: Buffer): "utf-16le" | "utf-16be" | 
     if (be.ratio >= le.ratio + 0.2) return "utf-16be";
   }
   return null;
+}
+
+function sniffShortAsciiUtf16(sample: Buffer): "utf-16le" | "utf-16be" | null {
+  if (sample.length < 4) return null;
+  const pairs = sample.length / 2;
+  const le = countAsciiNulPairs(sample, "utf-16le");
+  const be = countAsciiNulPairs(sample, "utf-16be");
+  if (le === pairs && be === 0) return "utf-16le";
+  if (be === pairs && le === 0) return "utf-16be";
+  return null;
+}
+
+function countAsciiNulPairs(sample: Buffer, encoding: "utf-16le" | "utf-16be"): number {
+  let count = 0;
+  for (let index = 0; index < sample.length; index += 2) {
+    const first = sample[index] ?? 0;
+    const second = sample[index + 1] ?? 0;
+    const low = encoding === "utf-16le" ? first : second;
+    const high = encoding === "utf-16le" ? second : first;
+    if (high === 0 && isAsciiTextByte(low)) count += 1;
+  }
+  return count;
+}
+
+function isAsciiTextByte(value: number): boolean {
+  return value === 0x09 || value === 0x0a || value === 0x0d || (value >= 0x20 && value <= 0x7e);
 }
 
 function nulBias(sample: Buffer): { le: number; be: number } {

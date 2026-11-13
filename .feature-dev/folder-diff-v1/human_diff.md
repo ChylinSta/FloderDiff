@@ -28,3 +28,10 @@ The autonomous review gate was waived in `design_review.md`. This list is what a
 - Changed lines highlight the changed words. Identical text files still show a match banner and do not paint every unchanged line.
 - Default ignores are `node_modules`, `.git`, and `.DS_Store`. `*.log` is opt-in. Clearing the ignore field compares everything, including dependency folders.
 - Folder compare streams progress and can be cancelled. A very large tree still spends the time hashing; the page should stay responsive while that runs.
+
+## Iterate 4
+
+- Canceling a copy should remove files that copy created and restore files it overwrote. A file that was already on the destination, and that this copy did not write, should still be there. If the notice starts with “Partial copy”, those named paths were left behind on purpose.
+- The copying line should disappear before hashing starts.
+- UTF-16 without a BOM still needs a human look on a real file. Two-byte samples and text that looks valid in both endiannesses stay binary.
+- Windows Open, drive-letter browse, and `start.cmd` are still not verified on a Windows machine.
